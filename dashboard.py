@@ -11,9 +11,14 @@ TELEGRAM_TOKEN = "8828747525:AAEEEWWp9DOxTGJ8WL0s3wLrDwCYTZtMZtI"
 CHAT_IDS = ["8789981851", "8248273321"]
 
 # --- State Tracking (Prevents Spam Messaging) ---
-window_advice = None  # Can be "Open", "Close_Heat", "Close_AC", or "Close"
-last_19c_warning_date = None  # Tracks the date of the last 19°C warning to ensure it fires once a day
-is_too_hot = False  # Tracks if the day got too hot, waiting to cool down
+window_advice = None
+is_too_hot = False
+
+# Dog Walking & Forecast States
+last_19c_warning_date = None
+last_forecast_date = None
+forecasted_max_temp = None
+cool_day_notified = False
 
 # --- Logging Configuration ---
 LOG_FILE = "sensor_data_log.csv"
@@ -58,9 +63,25 @@ def calculate_dew_point(temp, humi):
         return None
 
 
+# --- Weather API Helper ---
+def get_daily_max_temp():
+    """Fetches today's forecasted maximum temperature for Southampton."""
+    url = "https://api.open-meteo.com/v1/forecast?latitude=50.9039&longitude=-1.4043&daily=temperature_2m_max&timezone=Europe%2FLondon&forecast_days=1"
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        max_temp = data['daily']['temperature_2m_max'][0]
+        return float(max_temp)
+    except Exception as e:
+        print(f"Failed to fetch weather forecast: {e}")
+        return None
+
+
 # --- Main Logic Evaluator ---
 def evaluate_smart_rules():
-    global window_advice, last_19c_warning_date, is_too_hot
+    global window_advice, is_too_hot
+    global last_19c_warning_date, last_forecast_date, forecasted_max_temp, cool_day_notified
 
     in_temp_raw = data_cache["indoor_temp"]
     in_humi_raw = data_cache["indoor_humi"]
@@ -80,107 +101,113 @@ def evaluate_smart_rules():
     except (ValueError, TypeError):
         t_in, h_in, t_out, h_out = None, None, None, None
 
-    # 1. Rule: Open/Close Windows based on Season and Comfort Targets
-    if all(v is not None for v in [t_in, h_in, t_out, h_out, in_dew, out_dew]):
+    today = datetime.date.today()
+    now = datetime.datetime.now()
 
+    # ==========================================
+    # 1. Fetch Daily Forecast (Once a day)
+    # ==========================================
+    if last_forecast_date != today:
+        max_temp = get_daily_max_temp()
+        if max_temp is not None:
+            forecasted_max_temp = max_temp
+            last_forecast_date = today
+            cool_day_notified = False
+            last_19c_warning_date = None
+            is_too_hot = False
+
+    # ==========================================
+    # 2. Window Logic (Seasonal)
+    # ==========================================
+    if all(v is not None for v in [t_in, h_in, t_out, h_out, in_dew, out_dew]):
         new_advice_state = ""
         telegram_msg = ""
         ui_text = ""
         ui_fg = ""
         ui_bg = ""
 
-        current_month = datetime.date.today().month
+        current_month = now.month
 
-        # ==========================================
-        # COLD SEASON LOGIC (Goal: Keep the house warm)
-        # ==========================================
+        # COLD SEASON LOGIC
         if current_month in COLD_SEASON_MONTHS:
             if t_in < 18.0:
-                # Too cold inside
                 if t_out > t_in:
                     new_advice_state = "Open"
-                    telegram_msg = "🍃 Free heat! It is warmer outside. Open windows, turn heating off."
+                    telegram_msg = "🍃 Free heat! It is warmer outside. Open windows, turn heating off.\n\n[Condition: COLD_SEASON | t_in < 18.0 | t_out > t_in]"
                     ui_text = "🍃 WINDOWS OPEN\n(Free Heat Outside)"
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
                 else:
                     new_advice_state = "Close_Heat"
-                    telegram_msg = "🔥 It is cold! Close windows, keep heat trapped (or turn heater on)."
+                    telegram_msg = "🔥 It is cold! Close windows, keep heat trapped (or turn heater on).\n\n[Condition: COLD_SEASON | t_in < 18.0 | t_out <= t_in]"
                     ui_text = "🔥 CLOSE WINDOWS\n(Keep Warmth Trapped)"
                     ui_fg = "#ff6b6b"
                     ui_bg = "#2d1414"
             elif t_in > 22.0:
-                # Oddly hot inside during winter (cooking, fireplace, etc.)
                 if t_out < t_in:
                     new_advice_state = "Open"
-                    telegram_msg = "🍃 Cooling alert! It's unusually warm inside. Open windows to vent."
+                    telegram_msg = "🍃 Cooling alert! It's unusually warm inside. Open windows to vent.\n\n[Condition: COLD_SEASON | t_in > 22.0 | t_out < t_in]"
                     ui_text = "🍃 WINDOWS OPEN\n(Vent Excess Heat)"
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
                 else:
                     new_advice_state = "Close"
-                    telegram_msg = "⚠️ Unusually hot outside too. Close windows."
+                    telegram_msg = "⚠️ Unusually hot outside too. Close windows.\n\n[Condition: COLD_SEASON | t_in > 22.0 | t_out >= t_in]"
                     ui_text = "⚠️ KEEP WINDOWS CLOSED"
                     ui_fg = "#ffa44a"
                     ui_bg = "#2d1414"
             else:
-                # Optimal indoor temps (18-22C)
                 if 18.0 <= t_out <= 22.0 and h_out <= 60.0:
                     new_advice_state = "Open"
-                    telegram_msg = "🍃 Pleasant outside! Open windows for fresh air without losing heat."
+                    telegram_msg = "🍃 Pleasant outside! Open windows for fresh air without losing heat.\n\n[Condition: COLD_SEASON | 18.0 <= t_in <= 22.0 | 18.0 <= t_out <= 22.0 & h_out <= 60.0]"
                     ui_text = "🍃 WINDOWS OPEN\n(Nice Weather)"
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
                 else:
                     new_advice_state = "Close"
-                    telegram_msg = "⚠️ Close windows to maintain our perfect indoor temperature."
+                    telegram_msg = "⚠️ Close windows to maintain our perfect indoor temperature.\n\n[Condition: COLD_SEASON | 18.0 <= t_in <= 22.0 | Outdoor temp/humidity not optimal]"
                     ui_text = "⚠️ KEEP WINDOWS CLOSED\n(Protect Indoor Temp)"
                     ui_fg = "#ffa44a"
                     ui_bg = "#2d1414"
 
-        # ==========================================
-        # WARM SEASON LOGIC (Goal: Keep the house cool)
-        # ==========================================
+        # WARM SEASON LOGIC
         elif current_month in WARM_SEASON_MONTHS:
             if t_in > 22.0 or h_in > 60.0:
-                # Too warm or too muggy inside
                 if t_out < t_in and out_dew < in_dew:
                     new_advice_state = "Open"
-                    telegram_msg = "🍃 Free cooling! Outside is cooler and drier. Open windows, AC off."
+                    telegram_msg = "🍃 Free cooling! Outside is cooler and drier. Open windows, AC off.\n\n[Condition: WARM_SEASON | t_in > 22.0 or h_in > 60.0 | t_out < t_in & out_dew < in_dew]"
                     ui_text = "🍃 WINDOWS OPEN\n(Cool & Dry Outside)"
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
                 else:
                     new_advice_state = "Close_AC"
-                    telegram_msg = "❄️ Muggy/Hot alert! Close windows, turn AC on to reach target temp."
+                    telegram_msg = "❄️ Muggy/Hot alert! Close windows, turn AC on to reach target temp.\n\n[Condition: WARM_SEASON | t_in > 22.0 or h_in > 60.0 | t_out >= t_in or out_dew >= in_dew]"
                     ui_text = "❄️ CLOSE WINDOWS\n(Block Heat/Humidity)"
                     ui_fg = "#74b9ff"
                     ui_bg = "#14222d"
             elif t_in < 18.0:
-                # Unusually cold inside during summer
                 if t_out > t_in:
                     new_advice_state = "Open"
-                    telegram_msg = "🍃 A bit chilly inside! Open windows to let the summer warmth in."
+                    telegram_msg = "🍃 A bit chilly inside! Open windows to let the summer warmth in.\n\n[Condition: WARM_SEASON | t_in < 18.0 | t_out > t_in]"
                     ui_text = "🍃 WINDOWS OPEN\n(Let Warmth In)"
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
                 else:
                     new_advice_state = "Close"
-                    telegram_msg = "⚠️ Cold outside too. Close windows."
+                    telegram_msg = "⚠️ Cold outside too. Close windows.\n\n[Condition: WARM_SEASON | t_in < 18.0 | t_out <= t_in]"
                     ui_text = "⚠️ KEEP WINDOWS CLOSED"
                     ui_fg = "#ffa44a"
                     ui_bg = "#2d1414"
             else:
-                # Optimal indoor temps (18-22C)
                 if t_out > 22.0 or out_dew > 14.0 or h_out > 60.0:
                     new_advice_state = "Close"
-                    telegram_msg = "⚠️ Close windows! It's getting hot/muggy outside. Trap our cool air inside."
+                    telegram_msg = "⚠️ Close windows! It's getting hot/muggy outside. Trap our cool air inside.\n\n[Condition: WARM_SEASON | if t_out > 22.0 or out_dew > 14.0 or h_out > 60.0]"
                     ui_text = "⚠️ KEEP WINDOWS CLOSED\n(Protect Indoor Temp)"
                     ui_fg = "#ffa44a"
                     ui_bg = "#2d1414"
                 else:
                     new_advice_state = "Open"
-                    telegram_msg = "🍃 Pleasant outside! Open windows for fresh summer air."
+                    telegram_msg = "🍃 Pleasant outside! Open windows for fresh summer air.\n\n[Condition: WARM_SEASON | 18.0 <= t_in <= 22.0 & h_in <= 60.0 | Outdoor conditions optimal]"
                     ui_text = "🍃 WINDOWS OPEN\n(Nice Weather)"
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
@@ -194,22 +221,32 @@ def evaluate_smart_rules():
         lbl_advice.config(text=ui_text, fg=ui_fg, bg=ui_bg)
         frame_advice.config(bg=ui_bg)
 
-    # 2. Rule: Dog Walking Alerts
-    if t_out is not None:
-        today = datetime.date.today()
+    # ==========================================
+    # 3. Dog Walking Alerts (Forecast & Real-time)
+    # ==========================================
+    if forecasted_max_temp is not None:
 
-        if 19.0 <= t_out < 22.0:
-            if last_19c_warning_date != today:
+        # Scenario A: The day is staying cool
+        if forecasted_max_temp <= 23.0 and now.hour >= 8 and not cool_day_notified:
+            send_telegram(
+                f"☁️ It's staying cool today (Forecast max: {forecasted_max_temp}°C). Walk Kizzy whenever she demands it!\n\n[Condition: forecasted_max_temp <= 23.0 & time >= 08:00]")
+            cool_day_notified = True
+
+        # Scenario B: The day is going to get hot
+        if forecasted_max_temp > 23.0 and t_out is not None:
+            if 19.0 <= t_out < 22.0 and last_19c_warning_date != today:
                 last_19c_warning_date = today
                 send_telegram(
-                    f"☀️ Warming up! It's currently {t_out}°C outside. Walk Kizzy soon before it reaches 22°C.")
+                    f"☀️ Warming up! It's currently {t_out}°C outside (Forecast max: {forecasted_max_temp}°C). Walk Kizzy soon before it reaches 22°C.\n\n[Condition: forecasted_max_temp > 23.0 & 19.0 <= t_out < 22.0 & not_alerted_today]")
 
+    # Absolute failsafe (because UK weather forecasts are sometimes wrong)
+    if t_out is not None:
         if t_out >= 22.5:
             is_too_hot = True
-
         elif t_out <= 22.0 and is_too_hot:
             is_too_hot = False
-            send_telegram(f"🐕 Safe to walk Kizzy! The temperature has cooled down to {t_out}°C.")
+            send_telegram(
+                f"🐕 Safe to walk Kizzy again! The temperature has cooled down to {t_out}°C.\n\n[Condition: t_out <= 22.0 & is_too_hot_flag_was_true]")
 
 
 # --- MQTT Callback ---
@@ -264,7 +301,6 @@ def log_sensor_data():
             data_cache["outdoor_humi"]
         ])
 
-    # Schedule the next reading
     schedule_next_log()
 
 
