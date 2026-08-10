@@ -7,6 +7,8 @@ import csv
 import os
 
 # --- Telegram Configuration ---
+# NOTE: this token was shared in plain text - regenerate it via BotFather and
+# ideally load it from an environment variable instead of hardcoding it.
 TELEGRAM_TOKEN = "8828747525:AAEEEWWp9DOxTGJ8WL0s3wLrDwCYTZtMZtI"
 CHAT_IDS = ["8789981851", "8248273321"]
 
@@ -19,6 +21,11 @@ last_19c_warning_date = None
 last_forecast_date = None
 forecasted_max_temp = None
 cool_day_notified = False
+
+# --- Hourly Sensor Report Configuration ---
+HOURLY_REPORT_START_HOUR = 8    # first report of the day (08:00)
+HOURLY_REPORT_END_HOUR = 21     # last report of the day (21:00 = 9pm)
+hourly_reports_enabled = False  # controlled by the toggle switch in the header
 
 # --- Logging Configuration ---
 LOG_FILE = "sensor_data_log.csv"
@@ -76,6 +83,62 @@ def get_daily_max_temp():
     except Exception as e:
         print(f"Failed to fetch weather forecast: {e}")
         return None
+
+
+# --- Custom Toggle Switch Widget ---
+class ToggleSwitch(tk.Canvas):
+    """A finger-friendly sliding on/off switch drawn on a Canvas."""
+
+    def __init__(self, parent, width=76, height=36, on_color="#4ade80",
+                 off_color="#4a4a4a", knob_color="#ffffff", bg="#121212",
+                 command=None, initial=False):
+        super().__init__(parent, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0)
+        self.sw_width = width
+        self.sw_height = height
+        self.on_color = on_color
+        self.off_color = off_color
+        self.knob_color = knob_color
+        self.command = command
+        self.state_on = bool(initial)
+
+        self.bind("<Button-1>", self.toggle)
+        self._draw()
+
+    def _draw_track(self, color):
+        r = self.sw_height / 2
+        self.create_oval(0, 0, self.sw_height, self.sw_height,
+                         fill=color, outline=color)
+        self.create_oval(self.sw_width - self.sw_height, 0,
+                         self.sw_width, self.sw_height,
+                         fill=color, outline=color)
+        self.create_rectangle(r, 0, self.sw_width - r, self.sw_height,
+                              fill=color, outline=color)
+
+    def _draw(self):
+        self.delete("all")
+        self._draw_track(self.on_color if self.state_on else self.off_color)
+
+        pad = 4
+        d = self.sw_height - (pad * 2)
+        x0 = (self.sw_width - pad - d) if self.state_on else pad
+        self.create_oval(x0, pad, x0 + d, pad + d,
+                         fill=self.knob_color, outline=self.knob_color)
+
+    def toggle(self, event=None):
+        self.state_on = not self.state_on
+        self._draw()
+        if self.command:
+            self.command(self.state_on)
+
+    def set(self, value):
+        self.state_on = bool(value)
+        self._draw()
+        if self.command:
+            self.command(self.state_on)
+
+    def get(self):
+        return self.state_on
 
 
 # --- Main Logic Evaluator ---
@@ -277,6 +340,70 @@ def on_message(client, userdata, message):
     lbl_out_dew.config(text=f"Dew Point: {out_dew if out_dew is not None else '--.-'} °C")
 
 
+# --- Hourly Sensor Report ---
+def build_sensor_report():
+    """Builds the Telegram message containing the current sensor readings."""
+    in_dew = calculate_dew_point(data_cache["indoor_temp"], data_cache["indoor_humi"])
+    out_dew = calculate_dew_point(data_cache["outdoor_temp"], data_cache["outdoor_humi"])
+
+    def fmt(value, suffix=""):
+        return f"{value}{suffix}" if value is not None else "--"
+
+    stamp = datetime.datetime.now().strftime("%H:%M")
+
+    return (
+        f"📊 Hourly Sensor Report ({stamp})\n"
+        f"\n"
+        f"🏠 Indoor\n"
+        f"   Temperature: {fmt(data_cache['indoor_temp'], ' °C')}\n"
+        f"   Humidity: {fmt(data_cache['indoor_humi'], '%')}\n"
+        f"   Dew Point: {fmt(in_dew, ' °C')}\n"
+        f"\n"
+        f"🌳 Outdoor\n"
+        f"   Temperature: {fmt(data_cache['outdoor_temp'], ' °C')}\n"
+        f"   Humidity: {fmt(data_cache['outdoor_humi'], '%')}\n"
+        f"   Dew Point: {fmt(out_dew, ' °C')}"
+    )
+
+
+def send_hourly_report():
+    """Fires on the hour. Sends readings only if the toggle is on and we're in the time window."""
+    now = datetime.datetime.now()
+
+    if hourly_reports_enabled and HOURLY_REPORT_START_HOUR <= now.hour <= HOURLY_REPORT_END_HOUR:
+        send_telegram(build_sensor_report())
+
+    schedule_next_hourly_report()
+
+
+def schedule_next_hourly_report():
+    """Calculates milliseconds until the next 00 minute mark."""
+    now = datetime.datetime.now()
+    target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    delay_ms = int((target - now).total_seconds() * 1000)
+    root.after(max(delay_ms, 1000), send_hourly_report)
+
+
+def on_hourly_toggle(is_on):
+    """Called whenever the switch is tapped."""
+    global hourly_reports_enabled
+    hourly_reports_enabled = is_on
+
+    if is_on:
+        lbl_toggle.config(text="Hourly Report: ON", fg="#4ade80")
+        print("Hourly Telegram reports ENABLED "
+              f"({HOURLY_REPORT_START_HOUR:02d}:00 - {HOURLY_REPORT_END_HOUR:02d}:00)")
+    else:
+        lbl_toggle.config(text="Hourly Report: OFF", fg="#777777")
+        print("Hourly Telegram reports DISABLED")
+
+
+# --- Clock ---
+def update_clock():
+    lbl_clock.config(text=datetime.datetime.now().strftime("%a %d %b  %H:%M"))
+    root.after(10000, update_clock)
+
+
 # --- Data Logging Functions ---
 def init_log_file():
     """Creates the CSV file with headers if it doesn't exist."""
@@ -323,8 +450,28 @@ root.title("Smart Home Hub")
 root.configure(bg="#121212")
 root.attributes('-fullscreen', True)
 
+# --- Header Bar (clock on the left, toggle switch on the right) ---
+frame_header = tk.Frame(root, bg="#121212")
+frame_header.place(relx=0.04, rely=0.015, relwidth=0.92, relheight=0.13)
+
+lbl_clock = tk.Label(frame_header, text="", font=("Helvetica", 10, "bold"),
+                     fg="#666666", bg="#121212")
+lbl_clock.pack(side="left", pady=4)
+
+toggle_hourly = ToggleSwitch(frame_header, width=76, height=36, bg="#121212",
+                             command=on_hourly_toggle, initial=False)
+toggle_hourly.pack(side="right", padx=(8, 0))
+
+lbl_toggle = tk.Label(frame_header, text="Hourly Report: OFF",
+                      font=("Helvetica", 10, "bold"), fg="#777777", bg="#121212")
+lbl_toggle.pack(side="right")
+
+# Tapping the label toggles too, giving a bigger touch target on the 3.5" screen
+lbl_toggle.bind("<Button-1>", toggle_hourly.toggle)
+
+# --- Sensor Panels ---
 frame_indoor = tk.Frame(root, bg="#1a1a1a", bd=2, relief="groove")
-frame_indoor.place(relx=0.04, rely=0.04, relwidth=0.44, relheight=0.7)
+frame_indoor.place(relx=0.04, rely=0.16, relwidth=0.44, relheight=0.58)
 
 tk.Label(frame_indoor, text="INDOOR", font=("Helvetica", 12, "bold"), fg="#3498db", bg="#1a1a1a").pack(pady=4)
 lbl_in_temp = tk.Label(frame_indoor, text="--.- °C", font=("Helvetica", 20, "bold"), fg="white", bg="#1a1a1a")
@@ -336,7 +483,7 @@ lbl_in_dew = tk.Label(frame_indoor, text="Dew Point: --.- °C", font=("Helvetica
 lbl_in_dew.pack(pady=4)
 
 frame_outdoor = tk.Frame(root, bg="#1a1a1a", bd=2, relief="groove")
-frame_outdoor.place(relx=0.52, rely=0.04, relwidth=0.44, relheight=0.7)
+frame_outdoor.place(relx=0.52, rely=0.16, relwidth=0.44, relheight=0.58)
 
 tk.Label(frame_outdoor, text="OUTDOOR", font=("Helvetica", 12, "bold"), fg="#2ecc71", bg="#1a1a1a").pack(pady=4)
 lbl_out_temp = tk.Label(frame_outdoor, text="--.- °C", font=("Helvetica", 20, "bold"), fg="white", bg="#1a1a1a")
@@ -348,7 +495,7 @@ lbl_out_dew = tk.Label(frame_outdoor, text="Dew Point: --.- °C", font=("Helveti
 lbl_out_dew.pack(pady=4)
 
 frame_advice = tk.Frame(root, bg="#1f1f1f", bd=2, relief="groove")
-frame_advice.place(relx=0.04, rely=0.78, relwidth=0.92, relheight=0.18)
+frame_advice.place(relx=0.04, rely=0.77, relwidth=0.92, relheight=0.19)
 
 lbl_advice = tk.Label(frame_advice, text="Awaiting sensor readings...", font=("Helvetica", 11, "bold"), fg="#888888",
                       bg="#1f1f1f")
@@ -359,6 +506,8 @@ root.bind("<Escape>", lambda e: root.destroy())
 # --- Initialization & Background Setup ---
 init_log_file()
 schedule_next_log()
+schedule_next_hourly_report()
+update_clock()
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_message = on_message
