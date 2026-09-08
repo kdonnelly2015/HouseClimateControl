@@ -22,6 +22,18 @@ last_forecast_date = None
 forecasted_max_temp = None
 cool_day_notified = False
 
+# --- Confirmation / Debounce Configuration ---
+# Nothing fires on a single reading. A condition has to still be true when it is
+# re-evaluated at least CONFIRMATION_SECONDS later, using a fresh sensor reading.
+CONFIRMATION_SECONDS = 5 * 60
+
+# key -> {"value": <candidate state>, "since": datetime, "readings": <snapshot>}
+pending_states = {}
+
+# The last advice we actually committed to, so the screen keeps showing it while
+# a change is still being confirmed.
+committed_ui = None
+
 # --- Hourly Sensor Report Configuration ---
 HOURLY_REPORT_START_HOUR = 8    # first report of the day (08:00)
 HOURLY_REPORT_END_HOUR = 21     # last report of the day (21:00 = 9pm)
@@ -85,6 +97,92 @@ def get_daily_max_temp():
         return None
 
 
+# --- Confirmation Helpers ---
+def snapshot_readings():
+    """Freezes the current cache so we can compare against it 5 minutes later."""
+    return {
+        "at": datetime.datetime.now(),
+        "indoor_temp": data_cache["indoor_temp"],
+        "indoor_humi": data_cache["indoor_humi"],
+        "outdoor_temp": data_cache["outdoor_temp"],
+        "outdoor_humi": data_cache["outdoor_humi"],
+    }
+
+
+def format_snapshot(snap):
+    def fmt(value):
+        return value if value is not None else "--"
+
+    return (f"{snap['at'].strftime('%H:%M')}  "
+            f"in {fmt(snap['indoor_temp'])}°C/{fmt(snap['indoor_humi'])}%  "
+            f"out {fmt(snap['outdoor_temp'])}°C/{fmt(snap['outdoor_humi'])}%")
+
+
+def confirmation_footer(first_reading):
+    """Shows both readings that agreed, so the alert is auditable."""
+    return ("\n\n[Confirmed over 5 min:\n"
+            f"  first  -> {format_snapshot(first_reading)}\n"
+            f"  latest -> {format_snapshot(snapshot_readings())}]")
+
+
+def confirmed_reading(key, value):
+    """Hold a condition for CONFIRMATION_SECONDS before allowing it to act.
+
+    The first time `value` is seen for `key`, the current readings are stashed
+    and nothing happens. Once the same `value` is still being produced by a
+    later reading at least CONFIRMATION_SECONDS after that first one, the stashed
+    snapshot is returned (truthy) and the caller may act. Any other value seen in
+    between resets the timer, so a one-off spike never gets through.
+
+    Returns the first reading's snapshot on confirmation, otherwise None.
+    """
+    now = datetime.datetime.now()
+    pending = pending_states.get(key)
+
+    if pending is None or pending["value"] != value:
+        pending_states[key] = {
+            "value": value,
+            "since": now,
+            "readings": snapshot_readings(),
+        }
+        return None
+
+    if (now - pending["since"]).total_seconds() >= CONFIRMATION_SECONDS:
+        del pending_states[key]
+        return pending["readings"]
+
+    return None
+
+
+def clear_pending(key):
+    pending_states.pop(key, None)
+
+
+def pending_minutes_left(key):
+    """Whole minutes (rounded up) until the pending change for `key` confirms."""
+    pending = pending_states.get(key)
+    if pending is None:
+        return None
+
+    elapsed = (datetime.datetime.now() - pending["since"]).total_seconds()
+    remaining = max(CONFIRMATION_SECONDS - elapsed, 0)
+    return max(int(remaining // 60) + (1 if remaining % 60 else 0), 1)
+
+
+def render_advice(ui, note=None):
+    """Paints the advice panel. `ui` is the last confirmed advice (or None)."""
+    if ui is None:
+        text, fg, bg = "Awaiting confirmed readings...", "#888888", "#1f1f1f"
+    else:
+        text, fg, bg = ui["text"], ui["fg"], ui["bg"]
+
+    if note:
+        text = f"{text}\n{note}"
+
+    lbl_advice.config(text=text, fg=fg, bg=bg)
+    frame_advice.config(bg=bg)
+
+
 # --- Custom Toggle Switch Widget ---
 class ToggleSwitch(tk.Canvas):
     """A finger-friendly sliding on/off switch drawn on a Canvas."""
@@ -143,7 +241,7 @@ class ToggleSwitch(tk.Canvas):
 
 # --- Main Logic Evaluator ---
 def evaluate_smart_rules():
-    global window_advice, is_too_hot
+    global window_advice, is_too_hot, committed_ui
     global last_19c_warning_date, last_forecast_date, forecasted_max_temp, cool_day_notified
 
     in_temp_raw = data_cache["indoor_temp"]
@@ -178,6 +276,8 @@ def evaluate_smart_rules():
             cool_day_notified = False
             last_19c_warning_date = None
             is_too_hot = False
+            clear_pending("walk_soon")
+            clear_pending("outdoor_hot")
 
     # ==========================================
     # 2. Window Logic (Seasonal)
@@ -275,14 +375,24 @@ def evaluate_smart_rules():
                     ui_fg = "#4ade80"
                     ui_bg = "#142d14"
 
-        # Apply State Changes (Notify Telegram only on change)
-        if window_advice != new_advice_state:
-            window_advice = new_advice_state
-            send_telegram(telegram_msg)
+        fresh_ui = {"text": ui_text, "fg": ui_fg, "bg": ui_bg}
 
-        # Update Tkinter UI Elements
-        lbl_advice.config(text=ui_text, fg=ui_fg, bg=ui_bg)
-        frame_advice.config(bg=ui_bg)
+        # Apply State Changes (only once the same advice has held for 5 minutes)
+        if new_advice_state == window_advice:
+            # Nothing is changing - drop any half-finished countdown.
+            clear_pending("window")
+            committed_ui = fresh_ui
+            render_advice(committed_ui)
+        else:
+            first_reading = confirmed_reading("window", new_advice_state)
+            if first_reading:
+                window_advice = new_advice_state
+                send_telegram(telegram_msg + confirmation_footer(first_reading))
+                committed_ui = fresh_ui
+                render_advice(committed_ui)
+            else:
+                minutes = pending_minutes_left("window")
+                render_advice(committed_ui, f"⏳ Confirming change… ({minutes} min)")
 
     # ==========================================
     # 3. Dog Walking Alerts (Forecast & Real-time)
@@ -290,6 +400,7 @@ def evaluate_smart_rules():
     if forecasted_max_temp is not None:
 
         # Scenario A: The day is staying cool
+        # (Forecast-driven, not a sensor threshold, so no confirmation needed.)
         if forecasted_max_temp <= 23.0 and now.hour >= 8 and not cool_day_notified:
             send_telegram(
                 f"☁️ It's staying cool today (Forecast max: {forecasted_max_temp}°C). Walk Kizzy whenever she demands it!\n\n[Condition: forecasted_max_temp <= 23.0 & time >= 08:00]")
@@ -298,18 +409,33 @@ def evaluate_smart_rules():
         # Scenario B: The day is going to get hot
         if forecasted_max_temp > 23.0 and t_out is not None:
             if 19.0 <= t_out < 22.0 and last_19c_warning_date != today:
-                last_19c_warning_date = today
-                send_telegram(
-                    f"☀️ Warming up! It's currently {t_out}°C outside (Forecast max: {forecasted_max_temp}°C). Walk Kizzy soon before it reaches 22°C.\n\n[Condition: forecasted_max_temp > 23.0 & 19.0 <= t_out < 22.0 & not_alerted_today]")
+                first_reading = confirmed_reading("walk_soon", today.isoformat())
+                if first_reading:
+                    last_19c_warning_date = today
+                    send_telegram(
+                        f"☀️ Warming up! It's currently {t_out}°C outside (Forecast max: {forecasted_max_temp}°C). Walk Kizzy soon before it reaches 22°C.\n\n[Condition: forecasted_max_temp > 23.0 & 19.0 <= t_out < 22.0 & not_alerted_today]"
+                        + confirmation_footer(first_reading))
+            else:
+                clear_pending("walk_soon")
+        else:
+            clear_pending("walk_soon")
 
     # Absolute failsafe (because UK weather forecasts are sometimes wrong)
+    # Both the "gone hot" and "cooled down" transitions have to survive 5 minutes,
+    # so a single spiky reading can't flip the flag either way.
     if t_out is not None:
-        if t_out >= 22.5:
-            is_too_hot = True
+        if t_out >= 22.5 and not is_too_hot:
+            if confirmed_reading("outdoor_hot", "hot"):
+                is_too_hot = True
         elif t_out <= 22.0 and is_too_hot:
-            is_too_hot = False
-            send_telegram(
-                f"🐕 Safe to walk Kizzy again! The temperature has cooled down to {t_out}°C.\n\n[Condition: t_out <= 22.0 & is_too_hot_flag_was_true]")
+            first_reading = confirmed_reading("outdoor_hot", "cool")
+            if first_reading:
+                is_too_hot = False
+                send_telegram(
+                    f"🐕 Safe to walk Kizzy again! The temperature has cooled down to {t_out}°C.\n\n[Condition: t_out <= 22.0 & is_too_hot_flag_was_true]"
+                    + confirmation_footer(first_reading))
+        else:
+            clear_pending("outdoor_hot")
 
 
 # --- MQTT Callback ---
