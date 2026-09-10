@@ -57,6 +57,11 @@ latest_advice_display = {"text": "Awaiting confirmed readings...", "fg": "#88888
 # so remote viewers can tell if data has gone stale.
 last_update_time = None
 
+# Sky condition + rain chance from Open-Meteo (not something the sensors can
+# measure themselves). Refreshed on a timer, mirrored here so the web
+# dashboard can read it without touching Tkinter widgets.
+sky_condition_display = {"text": "Fetching sky conditions…", "fg": "#cccccc", "rain_chance": None}
+
 # --- Hourly Sensor Report Configuration ---
 HOURLY_REPORT_START_HOUR = 8    # first report of the day (08:00)
 HOURLY_REPORT_END_HOUR = 21     # last report of the day (21:00 = 9pm)
@@ -135,6 +140,102 @@ def get_daily_max_temp():
     except Exception as e:
         print(f"Failed to fetch weather forecast: {e}")
         return None
+
+
+WEATHER_CODE_MAP = {
+    0: ("☀️", "Clear skies"),
+    1: ("🌤️", "Mostly clear"),
+    2: ("⛅", "Partly cloudy"),
+    3: ("☁️", "Cloudy"),
+    45: ("🌫️", "Foggy"),
+    48: ("🌫️", "Foggy"),
+    51: ("🌦️", "Light drizzle"),
+    53: ("🌦️", "Drizzle"),
+    55: ("🌦️", "Heavy drizzle"),
+    56: ("🌧️", "Freezing drizzle"),
+    57: ("🌧️", "Freezing drizzle"),
+    61: ("🌧️", "Light rain"),
+    63: ("🌧️", "Rain"),
+    65: ("🌧️", "Heavy rain"),
+    66: ("🌧️", "Freezing rain"),
+    67: ("🌧️", "Freezing rain"),
+    71: ("🌨️", "Light snow"),
+    73: ("🌨️", "Snow"),
+    75: ("🌨️", "Heavy snow"),
+    77: ("🌨️", "Snow grains"),
+    80: ("🌦️", "Rain showers"),
+    81: ("🌦️", "Rain showers"),
+    82: ("⛈️", "Violent rain showers"),
+    85: ("🌨️", "Snow showers"),
+    86: ("🌨️", "Snow showers"),
+    95: ("⛈️", "Thunderstorm"),
+    96: ("⛈️", "Thunderstorm with hail"),
+    99: ("⛈️", "Thunderstorm with hail"),
+}
+
+
+def describe_weather_code(code):
+    """Maps an Open-Meteo WMO weather code to a short icon + label."""
+    icon, text = WEATHER_CODE_MAP.get(int(code), ("❓", "Unknown"))
+    return f"{icon} {text}"
+
+
+def get_sky_condition_from_api():
+    """Fetches just the current sky *appearance* (clear/cloudy/rain/etc, via
+    Open-Meteo's WMO weather code) for Southampton. This part still needs an
+    external source - a temperature/humidity/pressure sensor has no way to
+    "see" cloud cover, that needs an actual light or satellite/radar reading.
+    Returns a display string like "☁️ Cloudy", or None on failure.
+
+    Rain *probability* is calculated separately, locally, from the BME280's
+    own pressure trend - see estimate_rain_chance_from_pressure() below."""
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=50.9039&longitude=-1.4043"
+           "&current=weather_code&timezone=Europe%2FLondon&forecast_days=1")
+    try:
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        return describe_weather_code(data['current']['weather_code'])
+    except Exception as e:
+        print(f"Failed to fetch sky condition: {e}")
+        return None
+
+
+# Piecewise-linear curve mapping a 3-hour pressure trend (hPa) to a rough rain
+# probability (%). Reuses the same thresholds as the existing pressure-drop
+# rain alert, so the two features agree with each other:
+#   >= 0 hPa (steady/rising)                -> 5%  (baseline "unlikely")
+#   0 hPa -> RAIN_FALL_THRESHOLD_HPA (-3.0)  -> 5%  to 50%
+#   RAIN_FALL_THRESHOLD_HPA -> STORM_FALL_THRESHOLD_HPA (-6.0) -> 50% to 85%
+#   beyond STORM_FALL_THRESHOLD_HPA, continuing to -9.0        -> 85% to 95% (capped)
+# This is the classic "falling barometer means rain" rule of thumb, not a real
+# forecast model - a real model needs far more than pressure alone (humidity
+# aloft, wind, fronts, etc.) - but it's a reasonable local estimate and keeps
+# this figure independent of any internet weather API.
+RAIN_CHANCE_CURVE = [
+    (0.0, 5),
+    (RAIN_FALL_THRESHOLD_HPA, 50),
+    (STORM_FALL_THRESHOLD_HPA, 85),
+    (STORM_FALL_THRESHOLD_HPA * 1.5, 95),
+]
+
+
+def estimate_rain_chance_from_pressure(trend_hpa):
+    """Converts a pressure trend (hPa over RAIN_TREND_WINDOW_HOURS, from
+    get_pressure_trend_hpa()) into a rough rain-chance percentage using
+    RAIN_CHANCE_CURVE. Returns None if there isn't enough pressure history yet."""
+    if trend_hpa is None:
+        return None
+
+    if trend_hpa >= RAIN_CHANCE_CURVE[0][0]:
+        return RAIN_CHANCE_CURVE[0][1]
+
+    for (t1, p1), (t2, p2) in zip(RAIN_CHANCE_CURVE, RAIN_CHANCE_CURVE[1:]):
+        if t2 <= trend_hpa <= t1:
+            frac = (t1 - trend_hpa) / (t1 - t2)
+            return round(p1 + frac * (p2 - p1))
+
+    return RAIN_CHANCE_CURVE[-1][1]  # beyond the curve - cap at the highest value
 
 
 def get_current_precipitation():
@@ -715,6 +816,52 @@ def schedule_next_rain_check():
     root.after(15 * 60 * 1000, check_rain_status)  # every 15 minutes
 
 
+# --- Sky Condition (Open-Meteo weather code + hourly rain probability) ---
+def rain_chance_color(pct):
+    """Simple traffic-light coloring, consistent with the rest of the UI's palette."""
+    if pct is None:
+        return "#cccccc"
+    if pct < 20:
+        return "#4ade80"   # green - low chance
+    elif pct < 50:
+        return "#ffa44a"   # orange - moderate chance
+    else:
+        return "#74b9ff"   # blue - high chance
+
+
+def refresh_sky_condition():
+    """Runs periodically. Sky appearance still comes from Open-Meteo (see
+    get_sky_condition_from_api). Rain chance is now computed locally from the
+    BME280's own pressure trend, so it keeps working even if Open-Meteo is
+    unreachable - it just loses the "Clear/Cloudy" label in that case."""
+    global sky_condition_display
+
+    condition = get_sky_condition_from_api()
+    trend = get_pressure_trend_hpa()
+    rain_chance = estimate_rain_chance_from_pressure(trend)
+    color = rain_chance_color(rain_chance)
+
+    if condition is not None and rain_chance is not None:
+        display_text = f"{condition} · {rain_chance}% chance of rain"
+    elif condition is not None:
+        # Not enough pressure history yet (e.g. just after startup)
+        display_text = f"{condition} · gathering pressure trend…"
+    elif rain_chance is not None:
+        # Open-Meteo unreachable, but the local pressure-based estimate still works
+        display_text = f"{rain_chance}% chance of rain (from pressure trend)"
+    else:
+        display_text = "Sky data unavailable"
+
+    sky_condition_display = {"text": display_text, "fg": color, "rain_chance": rain_chance}
+    lbl_weather_sky.config(text=display_text, fg=color)
+
+    schedule_next_sky_check()
+
+
+def schedule_next_sky_check():
+    root.after(15 * 60 * 1000, refresh_sky_condition)  # every 15 minutes
+
+
 # --- Data Logging Functions ---
 def init_log_file():
     """Creates the CSV file with headers if it doesn't exist."""
@@ -796,6 +943,7 @@ def build_web_state():
             "pressure": data_cache["weather_pres"],
         },
         "advice": latest_advice_display,
+        "sky": sky_condition_display,
         "hourly_enabled": hourly_reports_enabled,
         "last_update": last_update_time.strftime("%H:%M:%S") if last_update_time else None,
     }
@@ -908,6 +1056,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-style: italic;
     margin-top: 6px;
   }
+  .panel .sky {
+    font-weight: bold;
+    margin-top: 8px;
+  }
   #indoor h2 { color: #3498db; }
   #outdoor h2 { color: #2ecc71; }
   #weather h2 { color: #f4b942; }
@@ -964,6 +1116,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="sub" id="weather-humi">Humidity: --%</div>
     <div class="dew" id="weather-dew">Dew Point: --.- °C</div>
     <div class="sub" id="weather-pres">Pressure: --.- hPa</div>
+    <div class="sub sky" id="weather-sky">Fetching sky conditions…</div>
   </div>
 </div>
 
@@ -995,6 +1148,10 @@ async function refresh() {
     document.getElementById('weather-humi').textContent = 'Humidity: ' + fmt(s.weather.humi, '%');
     document.getElementById('weather-dew').textContent = 'Dew Point: ' + fmt(s.weather.dew, ' °C');
     document.getElementById('weather-pres').textContent = 'Pressure: ' + fmt(s.weather.pressure, ' hPa');
+
+    const skyEl = document.getElementById('weather-sky');
+    skyEl.textContent = s.sky.text;
+    skyEl.style.color = s.sky.fg;
 
     const advice = document.getElementById('advice');
     advice.textContent = s.advice.text;
@@ -1127,6 +1284,9 @@ lbl_weather_dew.pack(pady=2)
 lbl_weather_pres = tk.Label(frame_weather, text="Pressure: --.- hPa", font=("Helvetica", 10), fg="#cccccc",
                             bg="#1a1a1a")
 lbl_weather_pres.pack(pady=2)
+lbl_weather_sky = tk.Label(frame_weather, text="Fetching sky conditions…", font=("Helvetica", 10, "bold"),
+                           fg="#cccccc", bg="#1a1a1a", wraplength=200, justify="center")
+lbl_weather_sky.pack(pady=(6, 2))
 
 frame_advice = tk.Frame(root, bg="#1f1f1f", bd=2, relief="groove")
 frame_advice.place(relx=0.04, rely=0.77, relwidth=0.92, relheight=0.19)
@@ -1142,6 +1302,7 @@ init_log_file()
 schedule_next_log()
 schedule_next_hourly_report()
 schedule_next_rain_check()
+refresh_sky_condition()  # fetch immediately, then re-schedules itself every 15 min
 update_clock()
 
 # Web dashboard runs in a daemon thread so it dies automatically when the
