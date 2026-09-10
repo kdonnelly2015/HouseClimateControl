@@ -5,12 +5,21 @@ import requests
 import datetime
 import csv
 import os
+import threading
+
+from flask import Flask, jsonify, request, Response
 
 # --- Telegram Configuration ---
 # NOTE: this token was shared in plain text - regenerate it via BotFather and
 # ideally load it from an environment variable instead of hardcoding it.
 TELEGRAM_TOKEN = "8828747525:AAEEEWWp9DOxTGJ8WL0s3wLrDwCYTZtMZtI"
 CHAT_IDS = ["8789981851", "8248273321"]
+
+# --- Web Dashboard Configuration ---
+# Serves a read-mostly copy of this UI to any browser on the LAN.
+# Visit http://<pi-ip>:WEB_PORT from any phone/laptop on the same network.
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 8080
 
 # --- State Tracking (Prevents Spam Messaging) ---
 window_advice = None
@@ -38,6 +47,15 @@ pending_states = {}
 # The last advice we actually committed to, so the screen keeps showing it while
 # a change is still being confirmed.
 committed_ui = None
+
+# Plain-data mirror of whatever is currently on screen in the advice panel.
+# Kept separate from the Tkinter widget so the web dashboard (running in a
+# different thread) never has to touch Tkinter objects directly.
+latest_advice_display = {"text": "Awaiting confirmed readings...", "fg": "#888888", "bg": "#1f1f1f"}
+
+# Timestamp of the last MQTT message we processed, shown on the web dashboard
+# so remote viewers can tell if data has gone stale.
+last_update_time = None
 
 # --- Hourly Sensor Report Configuration ---
 HOURLY_REPORT_START_HOUR = 8    # first report of the day (08:00)
@@ -236,7 +254,13 @@ def pending_minutes_left(key):
 
 
 def render_advice(ui, note=None):
-    """Paints the advice panel. `ui` is the last confirmed advice (or None)."""
+    """Paints the advice panel. `ui` is the last confirmed advice (or None).
+
+    Also mirrors the result into `latest_advice_display`, a plain dict that the
+    web dashboard reads from instead of touching Tkinter widgets directly.
+    """
+    global latest_advice_display
+
     if ui is None:
         text, fg, bg = "Awaiting confirmed readings...", "#888888", "#1f1f1f"
     else:
@@ -247,6 +271,8 @@ def render_advice(ui, note=None):
 
     lbl_advice.config(text=text, fg=fg, bg=bg)
     frame_advice.config(bg=bg)
+
+    latest_advice_display = {"text": text, "fg": fg, "bg": bg}
 
 
 # --- Custom Toggle Switch Widget ---
@@ -535,6 +561,8 @@ def evaluate_smart_rules():
 
 # --- MQTT Callback ---
 def on_message(client, userdata, message):
+    global last_update_time
+
     payload = message.payload.decode("utf-8")
     topic = message.topic
 
@@ -556,6 +584,8 @@ def on_message(client, userdata, message):
             record_pressure_reading(float(payload))
         except (ValueError, TypeError):
             pass
+
+    last_update_time = datetime.datetime.now()
 
     evaluate_smart_rules()
 
@@ -628,10 +658,16 @@ def schedule_next_hourly_report():
     root.after(max(delay_ms, 1000), send_hourly_report)
 
 
-def on_hourly_toggle(is_on):
-    """Called whenever the switch is tapped."""
+def apply_hourly_toggle(is_on):
+    """Single place that changes hourly_reports_enabled, called from either the
+    on-screen toggle switch (Tkinter thread) or the web dashboard (Flask thread).
+    Keeps both UIs and the underlying flag in sync."""
     global hourly_reports_enabled
     hourly_reports_enabled = is_on
+
+    if toggle_hourly.get() != is_on:
+        toggle_hourly.set(is_on)  # will re-fire on_hourly_toggle, which is fine (idempotent)
+        return
 
     if is_on:
         lbl_toggle.config(text="Hourly Report: ON", fg="#4ade80")
@@ -640,6 +676,11 @@ def on_hourly_toggle(is_on):
     else:
         lbl_toggle.config(text="Hourly Report: OFF", fg="#777777")
         print("Hourly Telegram reports DISABLED")
+
+
+def on_hourly_toggle(is_on):
+    """Called whenever the physical switch on the Pi's screen is tapped."""
+    apply_hourly_toggle(is_on)
 
 
 # --- Clock ---
@@ -719,6 +760,307 @@ def schedule_next_log():
 
     delay_ms = int((target - now).total_seconds() * 1000)
     root.after(delay_ms, log_sensor_data)
+
+
+# ==========================================
+# --- Web Dashboard (Flask) ---
+# ==========================================
+# Runs in its own background thread so it never blocks the Tkinter mainloop.
+# It only ever *reads* data_cache / globals and writes through apply_hourly_toggle,
+# so it stays safely decoupled from the Tkinter widgets themselves.
+
+flask_app = Flask(__name__)
+
+
+def build_web_state():
+    in_dew = calculate_dew_point(data_cache["indoor_temp"], data_cache["indoor_humi"])
+    out_dew = calculate_dew_point(data_cache["outdoor_temp"], data_cache["outdoor_humi"])
+    weather_dew = calculate_dew_point(data_cache["weather_temp"], data_cache["weather_humi"])
+
+    return {
+        "clock": datetime.datetime.now().strftime("%a %d %b  %H:%M:%S"),
+        "indoor": {
+            "temp": data_cache["indoor_temp"],
+            "humi": data_cache["indoor_humi"],
+            "dew": in_dew,
+        },
+        "outdoor": {
+            "temp": data_cache["outdoor_temp"],
+            "humi": data_cache["outdoor_humi"],
+            "dew": out_dew,
+        },
+        "weather": {
+            "temp": data_cache["weather_temp"],
+            "humi": data_cache["weather_humi"],
+            "dew": weather_dew,
+            "pressure": data_cache["weather_pres"],
+        },
+        "advice": latest_advice_display,
+        "hourly_enabled": hourly_reports_enabled,
+        "last_update": last_update_time.strftime("%H:%M:%S") if last_update_time else None,
+    }
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Home Hub</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #121212;
+    color: #eee;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    padding: 16px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 18px;
+  }
+  #clock {
+    font-size: 13px;
+    font-weight: bold;
+    color: #666;
+  }
+  #last-update {
+    font-size: 11px;
+    color: #555;
+    margin-top: 2px;
+  }
+  .toggle-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #toggle-label {
+    font-size: 13px;
+    font-weight: bold;
+    color: #777;
+  }
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 56px;
+    height: 30px;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background-color: #4a4a4a;
+    transition: .2s;
+    border-radius: 30px;
+  }
+  .slider:before {
+    position: absolute;
+    content: "";
+    height: 22px;
+    width: 22px;
+    left: 4px;
+    bottom: 4px;
+    background-color: white;
+    transition: .2s;
+    border-radius: 50%;
+  }
+  input:checked + .slider { background-color: #4ade80; }
+  input:checked + .slider:before { transform: translateX(26px); }
+
+  .panels {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  @media (max-width: 700px) {
+    .panels { grid-template-columns: 1fr; }
+  }
+  .panel {
+    background: #1a1a1a;
+    border: 2px solid #2a2a2a;
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+  }
+  .panel h2 {
+    margin: 0 0 8px 0;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+  }
+  .panel .temp {
+    font-size: 30px;
+    font-weight: bold;
+    margin: 6px 0;
+  }
+  .panel .sub {
+    font-size: 12px;
+    color: #aaa;
+    margin: 2px 0;
+  }
+  .panel .dew {
+    font-size: 12px;
+    font-style: italic;
+    margin-top: 6px;
+  }
+  #indoor h2 { color: #3498db; }
+  #outdoor h2 { color: #2ecc71; }
+  #weather h2 { color: #f4b942; }
+  #indoor .dew { color: #85c1e9; }
+  #outdoor .dew { color: #a3e4d7; }
+  #weather .dew { color: #f5cf87; }
+
+  #advice {
+    border: 2px solid #2a2a2a;
+    border-radius: 10px;
+    padding: 22px;
+    text-align: center;
+    font-weight: bold;
+    font-size: 16px;
+    white-space: pre-line;
+    background: #1f1f1f;
+    color: #888;
+    transition: background-color .3s, color .3s;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div id="clock">--</div>
+    <div id="last-update"></div>
+  </div>
+  <div class="toggle-wrap">
+    <span id="toggle-label">Hourly Report: OFF</span>
+    <label class="switch">
+      <input type="checkbox" id="toggle-input">
+      <span class="slider"></span>
+    </label>
+  </div>
+</header>
+
+<div class="panels">
+  <div class="panel" id="indoor">
+    <h2>INDOOR</h2>
+    <div class="temp" id="indoor-temp">--.- °C</div>
+    <div class="sub" id="indoor-humi">Humidity: --%</div>
+    <div class="dew" id="indoor-dew">Dew Point: --.- °C</div>
+  </div>
+  <div class="panel" id="outdoor">
+    <h2>OUTDOOR</h2>
+    <div class="temp" id="outdoor-temp">--.- °C</div>
+    <div class="sub" id="outdoor-humi">Humidity: --%</div>
+    <div class="dew" id="outdoor-dew">Dew Point: --.- °C</div>
+  </div>
+  <div class="panel" id="weather">
+    <h2>WEATHER</h2>
+    <div class="temp" id="weather-temp">--.- °C</div>
+    <div class="sub" id="weather-humi">Humidity: --%</div>
+    <div class="dew" id="weather-dew">Dew Point: --.- °C</div>
+    <div class="sub" id="weather-pres">Pressure: --.- hPa</div>
+  </div>
+</div>
+
+<div id="advice">Awaiting confirmed readings...</div>
+
+<script>
+const fmt = (v, unit) => (v === null || v === undefined) ? "--" + unit : v + unit;
+
+let togglingFromServer = false;
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/state');
+    const s = await res.json();
+
+    document.getElementById('clock').textContent = s.clock;
+    document.getElementById('last-update').textContent =
+      s.last_update ? ('Last reading: ' + s.last_update) : 'No readings yet';
+
+    document.getElementById('indoor-temp').textContent = fmt(s.indoor.temp, ' °C');
+    document.getElementById('indoor-humi').textContent = 'Humidity: ' + fmt(s.indoor.humi, '%');
+    document.getElementById('indoor-dew').textContent = 'Dew Point: ' + fmt(s.indoor.dew, ' °C');
+
+    document.getElementById('outdoor-temp').textContent = fmt(s.outdoor.temp, ' °C');
+    document.getElementById('outdoor-humi').textContent = 'Humidity: ' + fmt(s.outdoor.humi, '%');
+    document.getElementById('outdoor-dew').textContent = 'Dew Point: ' + fmt(s.outdoor.dew, ' °C');
+
+    document.getElementById('weather-temp').textContent = fmt(s.weather.temp, ' °C');
+    document.getElementById('weather-humi').textContent = 'Humidity: ' + fmt(s.weather.humi, '%');
+    document.getElementById('weather-dew').textContent = 'Dew Point: ' + fmt(s.weather.dew, ' °C');
+    document.getElementById('weather-pres').textContent = 'Pressure: ' + fmt(s.weather.pressure, ' hPa');
+
+    const advice = document.getElementById('advice');
+    advice.textContent = s.advice.text;
+    advice.style.color = s.advice.fg;
+    advice.style.backgroundColor = s.advice.bg;
+
+    const toggleInput = document.getElementById('toggle-input');
+    if (!togglingFromServer) {
+      toggleInput.checked = s.hourly_enabled;
+    }
+    document.getElementById('toggle-label').textContent =
+      'Hourly Report: ' + (s.hourly_enabled ? 'ON' : 'OFF');
+    document.getElementById('toggle-label').style.color = s.hourly_enabled ? '#4ade80' : '#777';
+  } catch (e) {
+    console.error('Failed to refresh dashboard state', e);
+  }
+}
+
+document.getElementById('toggle-input').addEventListener('change', async (e) => {
+  togglingFromServer = true;
+  try {
+    await fetch('/api/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: e.target.checked })
+    });
+  } catch (err) {
+    console.error('Failed to toggle hourly report', err);
+  } finally {
+    togglingFromServer = false;
+    refresh();
+  }
+});
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+
+</body>
+</html>
+"""
+
+
+@flask_app.route("/")
+def dashboard():
+    return Response(DASHBOARD_HTML, mimetype="text/html")
+
+
+@flask_app.route("/api/state")
+def api_state():
+    return jsonify(build_web_state())
+
+
+@flask_app.route("/api/toggle", methods=["POST"])
+def api_toggle():
+    payload = request.get_json(silent=True) or {}
+    is_on = bool(payload.get("enabled"))
+    # Tkinter widget updates happen on whichever thread calls this - the existing
+    # MQTT callback already does the same thing, so this is consistent with how
+    # the rest of the app already touches the UI from a background thread.
+    apply_hourly_toggle(is_on)
+    return jsonify({"enabled": hourly_reports_enabled})
+
+
+def start_web_server():
+    flask_app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
 
 
 # --- UI Setup ---
@@ -801,6 +1143,12 @@ schedule_next_log()
 schedule_next_hourly_report()
 schedule_next_rain_check()
 update_clock()
+
+# Web dashboard runs in a daemon thread so it dies automatically when the
+# Tkinter app (and thus the whole process) exits.
+web_thread = threading.Thread(target=start_web_server, daemon=True)
+web_thread.start()
+print(f"Web dashboard available on the LAN at http://192.168.1.132:{WEB_PORT}")
 
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_message = on_message
