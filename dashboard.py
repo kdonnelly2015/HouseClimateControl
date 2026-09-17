@@ -99,6 +99,10 @@ RAIN_FALL_THRESHOLD_HPA = -3.0
 STORM_FALL_THRESHOLD_HPA = -6.0
 RAIN_TREND_RESET_HPA = -1.5  # trend must recover above this before we'll alert again
 
+# --- Pressure Chart Configuration (web dashboard) ---
+CHART_HISTORY_HOURS = 24   # how much pressure history to retain for the trend chart
+MAX_CHART_POINTS = 300     # downsample the API response above this many points, to keep payloads small
+
 
 # --- Telegram Helper ---
 def send_telegram(message):
@@ -255,11 +259,14 @@ def get_current_precipitation():
 
 # --- Pressure Trend Helper (Weather/BME280 sensor) ---
 def record_pressure_reading(pressure_hpa):
-    """Appends a timestamped pressure reading and prunes anything older than we need."""
+    """Appends a timestamped pressure reading and prunes anything older than we
+    keep around. Retention is CHART_HISTORY_HOURS (for the web dashboard's
+    trend chart) - the rain-trend calculation below then filters this down
+    further to just its own RAIN_TREND_WINDOW_HOURS at read time."""
     global pressure_history
     now = datetime.datetime.now()
     pressure_history.append((now, pressure_hpa))
-    cutoff = now - datetime.timedelta(hours=RAIN_TREND_WINDOW_HOURS, minutes=30)
+    cutoff = now - datetime.timedelta(hours=CHART_HISTORY_HOURS)
     pressure_history = [(t, p) for (t, p) in pressure_history if t >= cutoff]
 
 
@@ -944,6 +951,8 @@ def build_web_state():
         },
         "advice": latest_advice_display,
         "sky": sky_condition_display,
+        "pressure_trend_hpa": get_pressure_trend_hpa(),
+        "rain_trend_window_hours": RAIN_TREND_WINDOW_HOURS,
         "hourly_enabled": hourly_reports_enabled,
         "last_update": last_update_time.strftime("%H:%M:%S") if last_update_time else None,
     }
@@ -1079,6 +1088,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     color: #888;
     transition: background-color .3s, color .3s;
   }
+
+  .chart-card {
+    background: #1a1a1a;
+    border: 2px solid #2a2a2a;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+  }
+  .chart-card .chart-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .chart-card h2 {
+    margin: 0;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    color: #f4b942;
+  }
+  .chart-card #pressure-trend {
+    font-size: 12px;
+    font-weight: bold;
+    color: #cccccc;
+  }
+  #pressure-chart {
+    width: 100%;
+    height: 160px;
+  }
+  .chart-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 160px;
+    color: #666;
+    font-size: 13px;
+  }
 </style>
 </head>
 <body>
@@ -1118,6 +1164,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="sub" id="weather-pres">Pressure: --.- hPa</div>
     <div class="sub sky" id="weather-sky">Fetching sky conditions…</div>
   </div>
+</div>
+
+<div class="chart-card">
+  <div class="chart-header">
+    <h2>PRESSURE TREND (24H)</h2>
+    <span id="pressure-trend">Trend: gathering data…</span>
+  </div>
+  <div id="pressure-chart"><div class="chart-empty">Gathering pressure history…</div></div>
 </div>
 
 <div id="advice">Awaiting confirmed readings...</div>
@@ -1165,10 +1219,126 @@ async function refresh() {
     document.getElementById('toggle-label').textContent =
       'Hourly Report: ' + (s.hourly_enabled ? 'ON' : 'OFF');
     document.getElementById('toggle-label').style.color = s.hourly_enabled ? '#4ade80' : '#777';
+
+    const trendEl = document.getElementById('pressure-trend');
+    if (s.pressure_trend_hpa === null || s.pressure_trend_hpa === undefined) {
+      trendEl.textContent = 'Trend: gathering data…';
+      trendEl.style.color = '#cccccc';
+    } else {
+      const sign = s.pressure_trend_hpa > 0 ? '+' : '';
+      trendEl.textContent = `Trend: ${sign}${s.pressure_trend_hpa} hPa / ${s.rain_trend_window_hours}h`;
+      trendEl.style.color = s.sky.fg;
+    }
   } catch (e) {
     console.error('Failed to refresh dashboard state', e);
   }
 }
+
+let lastPressureData = null;
+
+function drawPressureChart(data) {
+  const svgNS = "http://www.w3.org/2000/svg";
+  const container = document.getElementById('pressure-chart');
+  container.innerHTML = '';
+
+  if (!data || data.length < 2) {
+    container.innerHTML = '<div class="chart-empty">Gathering pressure history…</div>';
+    return;
+  }
+
+  const width = container.clientWidth || 600;
+  const height = 160;
+  const padding = { top: 10, right: 10, bottom: 22, left: 40 };
+
+  const pressures = data.map(d => d.pressure);
+  const times = data.map(d => new Date(d.timestamp).getTime());
+
+  let minP = Math.min(...pressures);
+  let maxP = Math.max(...pressures);
+  if (minP === maxP) { minP -= 1; maxP += 1; }
+  const pad = (maxP - minP) * 0.15;
+  minP -= pad;
+  maxP += pad;
+
+  const minT = times[0];
+  const maxT = times[times.length - 1];
+  const spanT = (maxT - minT) || 1;
+
+  const xScale = t => padding.left + ((t - minT) / spanT) * (width - padding.left - padding.right);
+  const yScale = p => padding.top + (1 - (p - minP) / (maxP - minP)) * (height - padding.top - padding.bottom);
+
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('width', '100%');
+  svg.setAttribute('height', height);
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  // Horizontal gridlines at min/max pressure
+  [Math.min(...pressures), Math.max(...pressures)].forEach(p => {
+    const y = yScale(p);
+    const line = document.createElementNS(svgNS, 'line');
+    line.setAttribute('x1', padding.left);
+    line.setAttribute('x2', width - padding.right);
+    line.setAttribute('y1', y);
+    line.setAttribute('y2', y);
+    line.setAttribute('stroke', '#2a2a2a');
+    line.setAttribute('stroke-width', '1');
+    svg.appendChild(line);
+
+    const label = document.createElementNS(svgNS, 'text');
+    label.setAttribute('x', 2);
+    label.setAttribute('y', y + 4);
+    label.setAttribute('fill', '#777');
+    label.setAttribute('font-size', '10');
+    label.textContent = p.toFixed(0);
+    svg.appendChild(label);
+  });
+
+  // Pressure line
+  const points = data.map(d => `${xScale(new Date(d.timestamp).getTime())},${yScale(d.pressure)}`).join(' ');
+  const polyline = document.createElementNS(svgNS, 'polyline');
+  polyline.setAttribute('points', points);
+  polyline.setAttribute('fill', 'none');
+  polyline.setAttribute('stroke', '#f4b942');
+  polyline.setAttribute('stroke-width', '2');
+  polyline.setAttribute('stroke-linejoin', 'round');
+  polyline.setAttribute('stroke-linecap', 'round');
+  svg.appendChild(polyline);
+
+  // Time axis labels (first / last point only, to stay uncluttered)
+  const firstLabel = document.createElementNS(svgNS, 'text');
+  firstLabel.setAttribute('x', padding.left);
+  firstLabel.setAttribute('y', height - 6);
+  firstLabel.setAttribute('fill', '#777');
+  firstLabel.setAttribute('font-size', '10');
+  firstLabel.textContent = data[0].time;
+  svg.appendChild(firstLabel);
+
+  const lastLabel = document.createElementNS(svgNS, 'text');
+  lastLabel.setAttribute('x', width - padding.right);
+  lastLabel.setAttribute('y', height - 6);
+  lastLabel.setAttribute('fill', '#777');
+  lastLabel.setAttribute('font-size', '10');
+  lastLabel.setAttribute('text-anchor', 'end');
+  lastLabel.textContent = data[data.length - 1].time;
+  svg.appendChild(lastLabel);
+
+  container.appendChild(svg);
+}
+
+async function refreshPressureChart() {
+  try {
+    const res = await fetch('/api/pressure_history');
+    lastPressureData = await res.json();
+    drawPressureChart(lastPressureData);
+  } catch (e) {
+    console.error('Failed to load pressure history', e);
+  }
+}
+
+window.addEventListener('resize', () => {
+  if (lastPressureData) drawPressureChart(lastPressureData);
+});
 
 document.getElementById('toggle-input').addEventListener('change', async (e) => {
   togglingFromServer = true;
@@ -1188,6 +1358,9 @@ document.getElementById('toggle-input').addEventListener('change', async (e) => 
 
 refresh();
 setInterval(refresh, 4000);
+
+refreshPressureChart();
+setInterval(refreshPressureChart, 60000);
 </script>
 
 </body>
@@ -1203,6 +1376,26 @@ def dashboard():
 @flask_app.route("/api/state")
 def api_state():
     return jsonify(build_web_state())
+
+
+@flask_app.route("/api/pressure_history")
+def api_pressure_history():
+    """Returns the retained pressure history (up to CHART_HISTORY_HOURS) for
+    the dashboard's trend chart, downsampled to MAX_CHART_POINTS if needed."""
+    history = list(pressure_history)  # snapshot - avoids mutation mid-iteration
+
+    if len(history) > MAX_CHART_POINTS:
+        step = len(history) / MAX_CHART_POINTS
+        history = [history[int(i * step)] for i in range(MAX_CHART_POINTS)]
+
+    return jsonify([
+        {
+            "time": t.strftime("%H:%M"),
+            "timestamp": t.isoformat(),
+            "pressure": round(p, 1),
+        }
+        for t, p in history
+    ])
 
 
 @flask_app.route("/api/toggle", methods=["POST"])
