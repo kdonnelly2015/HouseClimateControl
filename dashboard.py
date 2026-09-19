@@ -34,6 +34,7 @@ cool_day_notified = False
 # Rain States (Weather/BME280 sensor)
 rain_alert_active = False   # true while a pressure-drop rain warning is "live"
 currently_raining = False   # true while Open-Meteo reports active precipitation
+low_pressure_rain_active = False  # true while pressure is at/below the absolute rain threshold
 pressure_history = []       # list of (datetime, pressure_hpa) for trend detection
 
 # --- Confirmation / Debounce Configuration ---
@@ -98,6 +99,13 @@ RAIN_TREND_WINDOW_HOURS = 3
 RAIN_FALL_THRESHOLD_HPA = -3.0
 STORM_FALL_THRESHOLD_HPA = -6.0
 RAIN_TREND_RESET_HPA = -1.5  # trend must recover above this before we'll alert again
+
+# --- Low-Pressure Rain Threshold (BME280 absolute reading) ---
+# Separate from the trend-based rule above: this fires purely off the current
+# reading, regardless of how fast pressure got there. 1007 hPa is a widely used
+# rule-of-thumb "likely raining" cutoff for sea-level-adjusted pressure.
+LOW_PRESSURE_RAIN_THRESHOLD_HPA = 1007.0
+LOW_PRESSURE_RAIN_RESET_HPA = 1009.5  # must recover above this before we'll alert again (hysteresis)
 
 # --- Pressure Chart Configuration (web dashboard) ---
 CHART_HISTORY_HOURS = 24   # how much pressure history to retain for the trend chart
@@ -443,7 +451,7 @@ class ToggleSwitch(tk.Canvas):
 def evaluate_smart_rules():
     global window_advice, is_too_hot, committed_ui
     global last_19c_warning_date, last_forecast_date, forecasted_max_temp, cool_day_notified
-    global rain_alert_active
+    global rain_alert_active, low_pressure_rain_active
 
     in_temp_raw = data_cache["indoor_temp"]
     in_humi_raw = data_cache["indoor_humi"]
@@ -666,6 +674,38 @@ def evaluate_smart_rules():
             rain_alert_active = False
             clear_pending("rain_pressure_drop")
 
+    # ==========================================
+    # 5. Low-Pressure Rain Alert (BME280 absolute threshold)
+    # ==========================================
+    # Distinct from the trend-based prediction above: this fires purely on the
+    # *current* pressure reading being at/below LOW_PRESSURE_RAIN_THRESHOLD_HPA,
+    # regardless of how quickly it got there. Same 5-minute confirmation +
+    # hysteresis pattern as the rest of the app, so a single low spike doesn't
+    # trigger a false alarm and we don't re-notify every reading while it stays low.
+    weather_pres_raw = data_cache["weather_pres"]
+    try:
+        current_pressure = float(weather_pres_raw) if weather_pres_raw is not None else None
+    except (ValueError, TypeError):
+        current_pressure = None
+
+    if current_pressure is not None:
+        if current_pressure <= LOW_PRESSURE_RAIN_THRESHOLD_HPA and not low_pressure_rain_active:
+            first_reading = confirmed_reading("low_pressure_rain", "low")
+            if first_reading:
+                low_pressure_rain_active = True
+                send_telegram(
+                    f"🌧️ Likely raining - barometric pressure is {current_pressure} hPa "
+                    f"(at or below {LOW_PRESSURE_RAIN_THRESHOLD_HPA} hPa).\n\n"
+                    f"[Condition: BME280 pressure <= {LOW_PRESSURE_RAIN_THRESHOLD_HPA} hPa]"
+                    + confirmation_footer(first_reading))
+                update_sky_condition_display()
+        elif current_pressure > LOW_PRESSURE_RAIN_RESET_HPA and low_pressure_rain_active:
+            low_pressure_rain_active = False
+            clear_pending("low_pressure_rain")
+            update_sky_condition_display()
+        elif current_pressure > LOW_PRESSURE_RAIN_THRESHOLD_HPA:
+            clear_pending("low_pressure_rain")
+
 
 # --- MQTT Callback ---
 def on_message(client, userdata, message):
@@ -836,11 +876,11 @@ def rain_chance_color(pct):
         return "#74b9ff"   # blue - high chance
 
 
-def refresh_sky_condition():
-    """Runs periodically. Sky appearance still comes from Open-Meteo (see
-    get_sky_condition_from_api). Rain chance is now computed locally from the
-    BME280's own pressure trend, so it keeps working even if Open-Meteo is
-    unreachable - it just loses the "Clear/Cloudy" label in that case."""
+def update_sky_condition_display():
+    """Computes and applies the sky/rain-chance display. Split out from
+    refresh_sky_condition() so it can be called on-demand (e.g. the moment the
+    low-pressure rain alert flips - see section 5 of evaluate_smart_rules)
+    without also re-arming the recurring 15-minute timer."""
     global sky_condition_display
 
     condition = get_sky_condition_from_api()
@@ -848,7 +888,13 @@ def refresh_sky_condition():
     rain_chance = estimate_rain_chance_from_pressure(trend)
     color = rain_chance_color(rain_chance)
 
-    if condition is not None and rain_chance is not None:
+    if low_pressure_rain_active:
+        # Hard override: pressure has crossed the absolute "likely raining"
+        # threshold, regardless of what Open-Meteo's sky code or the trend
+        # curve says.
+        display_text = "🌧️ Likely raining"
+        color = "#74b9ff"
+    elif condition is not None and rain_chance is not None:
         display_text = f"{condition} · {rain_chance}% chance of rain"
     elif condition is not None:
         # Not enough pressure history yet (e.g. just after startup)
@@ -862,6 +908,10 @@ def refresh_sky_condition():
     sky_condition_display = {"text": display_text, "fg": color, "rain_chance": rain_chance}
     lbl_weather_sky.config(text=display_text, fg=color)
 
+
+def refresh_sky_condition():
+    """Runs periodically (every 15 min)."""
+    update_sky_condition_display()
     schedule_next_sky_check()
 
 
