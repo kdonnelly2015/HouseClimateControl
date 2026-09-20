@@ -1,3 +1,5 @@
+# This code is for Raspberry Pi 4
+
 import tkinter as tk
 import paho.mqtt.client as mqtt
 import math
@@ -137,6 +139,35 @@ def calculate_dew_point(temp, humi):
         return round((b * alpha) / (a - alpha), 1)
     except:
         return None
+
+
+# --- Clothing Recommendation (Web UI) ---
+# Outdoor (BME280) dew-point bands mapped to what's comfortable to wear.
+# Calibrated from real observations logged by Kieran and Ellice - provisional,
+# will be fine-tuned over time as more data points come in.
+CLOTHING_THERMALS_MAX = 8.0    # below this -> thermals
+CLOTHING_COAT_MAX = 10.0       # below this -> coat
+CLOTHING_JACKET_MAX = 13.2     # below this -> jacket
+CLOTHING_TRACKIES_MIN = 13.2   # the only band with actual data for both Kieran and Ellice
+CLOTHING_TRACKIES_MAX = 17.1
+CLOTHING_TROUSERS_MAX = 17.2   # below/at this (and above the trackies band) -> t-shirt and trousers
+                               # above this -> t-shirt and shorts
+
+
+def get_clothing_recommendation(dew_point):
+    if dew_point is None:
+        return None
+    if CLOTHING_TRACKIES_MIN <= dew_point <= CLOTHING_TRACKIES_MAX:
+        return {"kieran": "A t-shirt and trackies is fine", "ellice": "T-shirt and a coat"}
+    if dew_point < CLOTHING_THERMALS_MAX:
+        return {"kieran": "Thermals", "ellice": "Thermals"}
+    if dew_point < CLOTHING_COAT_MAX:
+        return {"kieran": "Coat", "ellice": "Coat"}
+    if dew_point < CLOTHING_JACKET_MAX:
+        return {"kieran": "Jacket", "ellice": "Coat"}
+    if dew_point <= CLOTHING_TROUSERS_MAX:
+        return {"kieran": "T-shirt and trousers", "ellice": "T-shirt and coat"}
+    return {"kieran": "T-shirt and shorts", "ellice": "T-shirt and trousers"}
 
 
 # --- Weather API Helper ---
@@ -455,8 +486,8 @@ def evaluate_smart_rules():
 
     in_temp_raw = data_cache["indoor_temp"]
     in_humi_raw = data_cache["indoor_humi"]
-    out_temp_raw = data_cache["outdoor_temp"]
-    out_humi_raw = data_cache["outdoor_humi"]
+    out_temp_raw = data_cache["weather_temp"]
+    out_humi_raw = data_cache["weather_humi"]
 
     # Calculate Dew Points
     in_dew = calculate_dew_point(in_temp_raw, in_humi_raw)
@@ -998,6 +1029,7 @@ def build_web_state():
             "humi": data_cache["weather_humi"],
             "dew": weather_dew,
             "pressure": data_cache["weather_pres"],
+            "clothing": get_clothing_recommendation(weather_dew),
         },
         "advice": latest_advice_display,
         "sky": sky_condition_display,
@@ -1213,6 +1245,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="dew" id="weather-dew">Dew Point: --.- °C</div>
     <div class="sub" id="weather-pres">Pressure: --.- hPa</div>
     <div class="sub sky" id="weather-sky">Fetching sky conditions…</div>
+    <div class="sub" id="weather-clothing" style="display:none;"></div>
   </div>
 </div>
 
@@ -1252,6 +1285,17 @@ async function refresh() {
     document.getElementById('weather-humi').textContent = 'Humidity: ' + fmt(s.weather.humi, '%');
     document.getElementById('weather-dew').textContent = 'Dew Point: ' + fmt(s.weather.dew, ' °C');
     document.getElementById('weather-pres').textContent = 'Pressure: ' + fmt(s.weather.pressure, ' hPa');
+
+    const clothingEl = document.getElementById('weather-clothing');
+    if (s.weather.clothing) {
+      const lines = [];
+      if (s.weather.clothing.kieran) lines.push(`Kieran: ${s.weather.clothing.kieran}`);
+      if (s.weather.clothing.ellice) lines.push(`Ellice: ${s.weather.clothing.ellice}`);
+      clothingEl.innerHTML = lines.join('<br>');
+      clothingEl.style.display = '';
+    } else {
+      clothingEl.style.display = 'none';
+    }
 
     const skyEl = document.getElementById('weather-sky');
     skyEl.textContent = s.sky.text;
