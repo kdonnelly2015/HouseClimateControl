@@ -81,8 +81,8 @@ LOG_FILE = "sensor_data_log.csv"
 data_cache = {
     "indoor_temp": None,
     "indoor_humi": None,
-    "outdoor_temp": None,
-    "outdoor_humi": None,
+    "cabin_temp": None,
+    "cabin_humi": None,
     "weather_temp": None,
     "weather_humi": None,
     "weather_pres": None,
@@ -335,8 +335,8 @@ def snapshot_readings():
         "at": datetime.datetime.now(),
         "indoor_temp": data_cache["indoor_temp"],
         "indoor_humi": data_cache["indoor_humi"],
-        "outdoor_temp": data_cache["outdoor_temp"],
-        "outdoor_humi": data_cache["outdoor_humi"],
+        "cabin_temp": data_cache["cabin_temp"],
+        "cabin_humi": data_cache["cabin_humi"],
     }
 
 
@@ -346,7 +346,7 @@ def format_snapshot(snap):
 
     return (f"{snap['at'].strftime('%H:%M')}  "
             f"in {fmt(snap['indoor_temp'])}°C/{fmt(snap['indoor_humi'])}%  "
-            f"out {fmt(snap['outdoor_temp'])}°C/{fmt(snap['outdoor_humi'])}%")
+            f"out {fmt(snap['cabin_temp'])}°C/{fmt(snap['cabin_humi'])}%")
 
 
 def confirmation_footer(first_reading):
@@ -749,10 +749,10 @@ def on_message(client, userdata, message):
         data_cache["indoor_temp"] = payload
     elif topic == "home/indoor/humidity":
         data_cache["indoor_humi"] = payload
-    elif topic == "home/outdoor/temperature":
-        data_cache["outdoor_temp"] = payload
-    elif topic == "home/outdoor/humidity":
-        data_cache["outdoor_humi"] = payload
+    elif topic == "home/cabin/temperature":
+        data_cache["cabin_temp"] = payload
+    elif topic == "home/cabin/humidity":
+        data_cache["cabin_humi"] = payload
     elif topic == "home/weather/temperature":
         data_cache["weather_temp"] = payload
     elif topic == "home/weather/humidity":
@@ -769,16 +769,16 @@ def on_message(client, userdata, message):
     evaluate_smart_rules()
 
     in_dew = calculate_dew_point(data_cache["indoor_temp"], data_cache["indoor_humi"])
-    out_dew = calculate_dew_point(data_cache["outdoor_temp"], data_cache["outdoor_humi"])
+    cabin_dew = calculate_dew_point(data_cache["cabin_temp"], data_cache["cabin_humi"])
     weather_dew = calculate_dew_point(data_cache["weather_temp"], data_cache["weather_humi"])
 
     lbl_in_temp.config(text=f"{data_cache['indoor_temp'] or '--.-'} °C")
     lbl_in_humi.config(text=f"Humidity: {data_cache['indoor_humi'] or '--'}%")
     lbl_in_dew.config(text=f"Dew Point: {in_dew if in_dew is not None else '--.-'} °C")
 
-    lbl_out_temp.config(text=f"{data_cache['outdoor_temp'] or '--.-'} °C")
-    lbl_out_humi.config(text=f"Humidity: {data_cache['outdoor_humi'] or '--'}%")
-    lbl_out_dew.config(text=f"Dew Point: {out_dew if out_dew is not None else '--.-'} °C")
+    lbl_cabin_temp.config(text=f"{data_cache['cabin_temp'] or '--.-'} °C")
+    lbl_cabin_humi.config(text=f"Humidity: {data_cache['cabin_humi'] or '--'}%")
+    lbl_cabin_dew.config(text=f"Dew Point: {cabin_dew if cabin_dew is not None else '--.-'} °C")
 
     lbl_weather_temp.config(text=f"{data_cache['weather_temp'] or '--.-'} °C")
     lbl_weather_humi.config(text=f"Humidity: {data_cache['weather_humi'] or '--'}%")
@@ -790,7 +790,7 @@ def on_message(client, userdata, message):
 def build_sensor_report():
     """Builds the Telegram message containing the current sensor readings."""
     in_dew = calculate_dew_point(data_cache["indoor_temp"], data_cache["indoor_humi"])
-    out_dew = calculate_dew_point(data_cache["outdoor_temp"], data_cache["outdoor_humi"])
+    cabin_dew = calculate_dew_point(data_cache["cabin_temp"], data_cache["cabin_humi"])
     weather_dew = calculate_dew_point(data_cache["weather_temp"], data_cache["weather_humi"])
 
     def fmt(value, suffix=""):
@@ -806,10 +806,10 @@ def build_sensor_report():
         f"   Humidity: {fmt(data_cache['indoor_humi'], '%')}\n"
         f"   Dew Point: {fmt(in_dew, ' °C')}\n"
         f"\n"
-        f"🌳 Outdoor\n"
-        f"   Temperature: {fmt(data_cache['outdoor_temp'], ' °C')}\n"
-        f"   Humidity: {fmt(data_cache['outdoor_humi'], '%')}\n"
-        f"   Dew Point: {fmt(out_dew, ' °C')}\n"
+        f"🏡 Cabin\n"
+        f"   Temperature: {fmt(data_cache['cabin_temp'], ' °C')}\n"
+        f"   Humidity: {fmt(data_cache['cabin_humi'], '%')}\n"
+        f"   Dew Point: {fmt(cabin_dew, ' °C')}\n"
         f"\n"
         f"🌦️ Weather\n"
         f"   Temperature: {fmt(data_cache['weather_temp'], ' °C')}\n"
@@ -958,7 +958,7 @@ def init_log_file():
             writer = csv.writer(file)
             writer.writerow([
                 "Timestamp", "Indoor_Temp", "Indoor_Hum",
-                "Outdoor_Temp", "Outdoor_Hum",
+                "Cabin_Temp", "Cabin_Hum",
                 "Weather_Temp", "Weather_Hum", "Weather_Pressure",
             ])
 
@@ -974,8 +974,8 @@ def log_sensor_data():
             timestamp,
             data_cache["indoor_temp"],
             data_cache["indoor_humi"],
-            data_cache["outdoor_temp"],
-            data_cache["outdoor_humi"],
+            data_cache["cabin_temp"],
+            data_cache["cabin_humi"],
             data_cache["weather_temp"],
             data_cache["weather_humi"],
             data_cache["weather_pres"],
@@ -1009,7 +1009,7 @@ flask_app = Flask(__name__)
 
 def build_web_state():
     in_dew = calculate_dew_point(data_cache["indoor_temp"], data_cache["indoor_humi"])
-    out_dew = calculate_dew_point(data_cache["outdoor_temp"], data_cache["outdoor_humi"])
+    cabin_dew = calculate_dew_point(data_cache["cabin_temp"], data_cache["cabin_humi"])
     weather_dew = calculate_dew_point(data_cache["weather_temp"], data_cache["weather_humi"])
 
     return {
@@ -1019,10 +1019,10 @@ def build_web_state():
             "humi": data_cache["indoor_humi"],
             "dew": in_dew,
         },
-        "outdoor": {
-            "temp": data_cache["outdoor_temp"],
-            "humi": data_cache["outdoor_humi"],
-            "dew": out_dew,
+        "cabin": {
+            "temp": data_cache["cabin_temp"],
+            "humi": data_cache["cabin_humi"],
+            "dew": cabin_dew,
         },
         "weather": {
             "temp": data_cache["weather_temp"],
@@ -1152,10 +1152,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     margin-top: 8px;
   }
   #indoor h2 { color: #3498db; }
-  #outdoor h2 { color: #2ecc71; }
+  #cabin h2 { color: #2ecc71; }
   #weather h2 { color: #f4b942; }
   #indoor .dew { color: #85c1e9; }
-  #outdoor .dew { color: #a3e4d7; }
+  #cabin .dew { color: #a3e4d7; }
   #weather .dew { color: #f5cf87; }
 
   #advice {
@@ -1232,11 +1232,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="sub" id="indoor-humi">Humidity: --%</div>
     <div class="dew" id="indoor-dew">Dew Point: --.- °C</div>
   </div>
-  <div class="panel" id="outdoor">
-    <h2>OUTDOOR</h2>
-    <div class="temp" id="outdoor-temp">--.- °C</div>
-    <div class="sub" id="outdoor-humi">Humidity: --%</div>
-    <div class="dew" id="outdoor-dew">Dew Point: --.- °C</div>
+  <div class="panel" id="cabin">
+    <h2>CABIN</h2>
+    <div class="temp" id="cabin-temp">--.- °C</div>
+    <div class="sub" id="cabin-humi">Humidity: --%</div>
+    <div class="dew" id="cabin-dew">Dew Point: --.- °C</div>
   </div>
   <div class="panel" id="weather">
     <h2>WEATHER</h2>
@@ -1277,9 +1277,9 @@ async function refresh() {
     document.getElementById('indoor-humi').textContent = 'Humidity: ' + fmt(s.indoor.humi, '%');
     document.getElementById('indoor-dew').textContent = 'Dew Point: ' + fmt(s.indoor.dew, ' °C');
 
-    document.getElementById('outdoor-temp').textContent = fmt(s.outdoor.temp, ' °C');
-    document.getElementById('outdoor-humi').textContent = 'Humidity: ' + fmt(s.outdoor.humi, '%');
-    document.getElementById('outdoor-dew').textContent = 'Dew Point: ' + fmt(s.outdoor.dew, ' °C');
+    document.getElementById('cabin-temp').textContent = fmt(s.cabin.temp, ' °C');
+    document.getElementById('cabin-humi').textContent = 'Humidity: ' + fmt(s.cabin.humi, '%');
+    document.getElementById('cabin-dew').textContent = 'Dew Point: ' + fmt(s.cabin.dew, ' °C');
 
     document.getElementById('weather-temp').textContent = fmt(s.weather.temp, ' °C');
     document.getElementById('weather-humi').textContent = 'Humidity: ' + fmt(s.weather.humi, '%');
@@ -1532,7 +1532,7 @@ lbl_toggle.pack(side="right")
 # Tapping the label toggles too, giving a bigger touch target on the 3.5" screen
 lbl_toggle.bind("<Button-1>", toggle_hourly.toggle)
 
-# --- Sensor Panels (Indoor / Outdoor / Weather, side by side) ---
+# --- Sensor Panels (Indoor / Cabin / Weather, side by side) ---
 frame_indoor = tk.Frame(root, bg="#1a1a1a", bd=2, relief="groove")
 frame_indoor.place(relx=0.02, rely=0.16, relwidth=0.30, relheight=0.58)
 
@@ -1545,17 +1545,17 @@ lbl_in_dew = tk.Label(frame_indoor, text="Dew Point: --.- °C", font=("Helvetica
                       bg="#1a1a1a")
 lbl_in_dew.pack(pady=4)
 
-frame_outdoor = tk.Frame(root, bg="#1a1a1a", bd=2, relief="groove")
-frame_outdoor.place(relx=0.35, rely=0.16, relwidth=0.30, relheight=0.58)
+frame_cabin = tk.Frame(root, bg="#1a1a1a", bd=2, relief="groove")
+frame_cabin.place(relx=0.35, rely=0.16, relwidth=0.30, relheight=0.58)
 
-tk.Label(frame_outdoor, text="OUTDOOR", font=("Helvetica", 12, "bold"), fg="#2ecc71", bg="#1a1a1a").pack(pady=4)
-lbl_out_temp = tk.Label(frame_outdoor, text="--.- °C", font=("Helvetica", 18, "bold"), fg="white", bg="#1a1a1a")
-lbl_out_temp.pack(pady=4)
-lbl_out_humi = tk.Label(frame_outdoor, text="Humidity: --%", font=("Helvetica", 10), fg="#aaaaaa", bg="#1a1a1a")
-lbl_out_humi.pack()
-lbl_out_dew = tk.Label(frame_outdoor, text="Dew Point: --.- °C", font=("Helvetica", 10, "italic"), fg="#a3e4d7",
+tk.Label(frame_cabin, text="CABIN", font=("Helvetica", 12, "bold"), fg="#2ecc71", bg="#1a1a1a").pack(pady=4)
+lbl_cabin_temp = tk.Label(frame_cabin, text="--.- °C", font=("Helvetica", 18, "bold"), fg="white", bg="#1a1a1a")
+lbl_cabin_temp.pack(pady=4)
+lbl_cabin_humi = tk.Label(frame_cabin, text="Humidity: --%", font=("Helvetica", 10), fg="#aaaaaa", bg="#1a1a1a")
+lbl_cabin_humi.pack()
+lbl_cabin_dew = tk.Label(frame_cabin, text="Dew Point: --.- °C", font=("Helvetica", 10, "italic"), fg="#a3e4d7",
                        bg="#1a1a1a")
-lbl_out_dew.pack(pady=4)
+lbl_cabin_dew.pack(pady=4)
 
 frame_weather = tk.Frame(root, bg="#1a1a1a", bd=2, relief="groove")
 frame_weather.place(relx=0.68, rely=0.16, relwidth=0.30, relheight=0.58)
