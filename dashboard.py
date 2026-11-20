@@ -109,6 +109,14 @@ RAIN_TREND_RESET_HPA = -1.5  # trend must recover above this before we'll alert 
 LOW_PRESSURE_RAIN_THRESHOLD_HPA = 1007.0
 LOW_PRESSURE_RAIN_RESET_HPA = 1009.5  # must recover above this before we'll alert again (hysteresis)
 
+# --- Overheat Safety Alarm (indoor + cabin) ---
+# If either indoor sensor goes above this, a Telegram alarm is sent every
+# OVERHEAT_REPEAT_SECONDS until it drops back down. Deliberately has NO
+# 5-minute confirmation delay - this is a safety alert, so it fires at once.
+OVERHEAT_THRESHOLD_C = 30.0
+OVERHEAT_REPEAT_SECONDS = 30
+overheat_active = {"indoor": False, "cabin": False}  # tracks which rooms are alarming
+
 # --- Pressure Chart Configuration (web dashboard) ---
 CHART_HISTORY_HOURS = 24   # how much pressure history to retain for the trend chart
 MAX_CHART_POINTS = 300     # downsample the API response above this many points, to keep payloads small
@@ -890,6 +898,46 @@ def schedule_next_rain_check():
     root.after(15 * 60 * 1000, check_rain_status)  # every 15 minutes
 
 
+# --- Overheat Safety Alarm ---
+def send_telegram_async(message):
+    """Sends without blocking the Tkinter mainloop, so a slow or unreachable
+    Telegram API can never freeze the dashboard or delay the next alarm."""
+    threading.Thread(target=send_telegram, args=(message,), daemon=True).start()
+
+
+def check_overheat():
+    """Runs every OVERHEAT_REPEAT_SECONDS. While the house or cabin is above
+    OVERHEAT_THRESHOLD_C, sends an alarm on every run; sends one all-clear
+    when a room drops back to or below the threshold."""
+    rooms = [
+        ("indoor", "🏠 HOUSE", data_cache["indoor_temp"]),
+        ("cabin", "🏡 CABIN", data_cache["cabin_temp"]),
+    ]
+
+    for key, label, raw in rooms:
+        try:
+            temp = float(raw) if raw is not None else None
+        except (ValueError, TypeError):
+            temp = None
+        if temp is None:
+            continue  # no reading yet - keep the current state
+
+        if temp > OVERHEAT_THRESHOLD_C:
+            overheat_active[key] = True
+            send_telegram_async(
+                f"🚨🔥 OVERHEAT ALARM - {label} is {temp}°C! 🔥🚨\n"
+                f"Above the {OVERHEAT_THRESHOLD_C:g}°C safety limit. Check inside now.\n"
+                f"Repeating every {OVERHEAT_REPEAT_SECONDS}s until it drops.\n\n"
+                f"[Condition: {key}_temp > {OVERHEAT_THRESHOLD_C:g}]")
+        elif overheat_active[key]:
+            overheat_active[key] = False
+            send_telegram_async(
+                f"✅ All clear - {label} has dropped to {temp}°C "
+                f"(at or below {OVERHEAT_THRESHOLD_C:g}°C). Overheat alarm stopped.")
+
+    root.after(OVERHEAT_REPEAT_SECONDS * 1000, check_overheat)
+
+
 # --- Sky Condition (Open-Meteo weather code + hourly rain probability) ---
 def rain_chance_color(pct):
     """Simple traffic-light coloring, consistent with the rest of the UI's palette."""
@@ -1585,6 +1633,7 @@ init_log_file()
 schedule_next_log()
 schedule_next_hourly_report()
 schedule_next_rain_check()
+check_overheat()  # safety alarm: checks now, then every OVERHEAT_REPEAT_SECONDS
 refresh_sky_condition()  # fetch immediately, then re-schedules itself every 15 min
 update_clock()
 
