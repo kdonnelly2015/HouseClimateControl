@@ -108,6 +108,19 @@ RAIN_TREND_RESET_HPA = -1.5  # trend must recover above this before we'll alert 
 # rule-of-thumb "likely raining" cutoff for sea-level-adjusted pressure.
 LOW_PRESSURE_RAIN_THRESHOLD_HPA = 1007.0
 LOW_PRESSURE_RAIN_RESET_HPA = 1009.5  # must recover above this before we'll alert again (hysteresis)
+# If pressure is low AND the outdoor air is saturated, say "Raining" rather
+# than "Likely raining".
+RAINING_HUMIDITY_PCT = 100.0
+
+
+def low_pressure_rain_label():
+    """'Raining' when outdoor humidity is at RAINING_HUMIDITY_PCT, otherwise
+    'Likely raining'. Only meaningful while pressure is below the rain threshold."""
+    try:
+        humi = float(data_cache["weather_humi"])
+    except (ValueError, TypeError):
+        humi = None
+    return "Raining" if humi is not None and humi >= RAINING_HUMIDITY_PCT else "Likely raining"
 
 # --- Overheat Safety Alarm (indoor + cabin) ---
 # If either indoor sensor goes above this, a Telegram alarm is sent every
@@ -729,9 +742,10 @@ def evaluate_smart_rules():
             if first_reading:
                 low_pressure_rain_active = True
                 send_telegram(
-                    f"🌧️ Likely raining - barometric pressure is {current_pressure} hPa "
-                    f"(at or below {LOW_PRESSURE_RAIN_THRESHOLD_HPA} hPa).\n\n"
-                    f"[Condition: BME280 pressure <= {LOW_PRESSURE_RAIN_THRESHOLD_HPA} hPa]"
+                    f"🌧️ {low_pressure_rain_label()} - barometric pressure is {current_pressure} hPa "
+                    f"(at or below {LOW_PRESSURE_RAIN_THRESHOLD_HPA} hPa), outdoor humidity {data_cache['weather_humi']}%.\n\n"
+                    f"[Condition: BME280 pressure <= {LOW_PRESSURE_RAIN_THRESHOLD_HPA} hPa; "
+                    f"\"Raining\" if humidity >= {RAINING_HUMIDITY_PCT:g}%]"
                     + confirmation_footer(first_reading))
                 update_sky_condition_display()
         elif current_pressure > LOW_PRESSURE_RAIN_RESET_HPA and low_pressure_rain_active:
@@ -967,7 +981,7 @@ def update_sky_condition_display():
         # Hard override: pressure has crossed the absolute "likely raining"
         # threshold, regardless of what Open-Meteo's sky code or the trend
         # curve says.
-        display_text = "🌧️ Likely raining"
+        display_text = f"🌧️ {low_pressure_rain_label()}"
         color = "#74b9ff"
     elif condition is not None and rain_chance is not None:
         display_text = f"{condition} · {rain_chance}% chance of rain"
