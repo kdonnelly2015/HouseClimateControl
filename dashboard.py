@@ -547,18 +547,14 @@ def evaluate_smart_rules():
                     ui_fg = "#ff6b6b"
                     ui_bg = "#2d1414"
             elif t_in > 22.0:
-                if t_out < t_in:
-                    new_advice_state = "Open"
-                    telegram_msg = "🍃 Cooling alert! It's unusually warm inside. Open windows to vent.\n\n[Condition: COLD_SEASON | t_in > 22.0 | t_out < t_in]"
-                    ui_text = "🍃 WINDOWS OPEN\n(Vent Excess Heat)"
-                    ui_fg = "#4ade80"
-                    ui_bg = "#142d14"
-                else:
-                    new_advice_state = "Close"
-                    telegram_msg = "⚠️ Unusually hot outside too. Close windows.\n\n[Condition: COLD_SEASON | t_in > 22.0 | t_out >= t_in]"
-                    ui_text = "⚠️ KEEP WINDOWS CLOSED"
-                    ui_fg = "#ffa44a"
-                    ui_bg = "#2d1414"
+                # In the cold season the excess warmth almost always comes from
+                # the heating, so turning it down is the fix - opening windows
+                # just throws paid-for heat outside. Venting is summer-only.
+                new_advice_state = "Heating_Down"
+                telegram_msg = f"🌡️ You can turn the heating down, it's > 22 degrees ({t_in}°C inside). Keep windows closed.\n\n[Condition: COLD_SEASON | t_in > 22.0]"
+                ui_text = "🌡️ Turn Heating Down\n(It's > 22°C Inside)"
+                ui_fg = "#ffa44a"
+                ui_bg = "#2d2214"
             else:
                 if 18.0 <= t_out <= 22.0 and h_out <= 60.0:
                     new_advice_state = "Open"
