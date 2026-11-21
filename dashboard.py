@@ -10,10 +10,9 @@ import os
 import threading
 
 from flask import Flask, jsonify, request, Response
+from typing import Optional
 
 # --- Telegram Configuration ---
-# NOTE: this token was shared in plain text - regenerate it via BotFather and
-# ideally load it from an environment variable instead of hardcoding it.
 TELEGRAM_TOKEN = "8828747525:AAEEEWWp9DOxTGJ8WL0s3wLrDwCYTZtMZtI"
 CHAT_IDS = ["8789981851", "8248273321"]
 
@@ -58,7 +57,7 @@ latest_advice_display = {"text": "Awaiting confirmed readings...", "fg": "#88888
 
 # Timestamp of the last MQTT message we processed, shown on the web dashboard
 # so remote viewers can tell if data has gone stale.
-last_update_time = None
+last_update_time: Optional[datetime.datetime] = None
 
 # Sky condition + rain chance from Open-Meteo (not something the sensors can
 # measure themselves). Refreshed on a timer, mirrored here so the web
@@ -78,7 +77,7 @@ LOG_FILE = "sensor_data_log.csv"
 # clean header, or just accept blank Weather columns for old rows.
 
 # Global dictionary to hold our data cache
-data_cache = {
+data_cache: dict[str, Optional[str]] = {
     "indoor_temp": None,
     "indoor_humi": None,
     "cabin_temp": None,
@@ -152,13 +151,13 @@ def calculate_dew_point(temp, humi):
     if temp is None or humi is None:
         return None
     try:
-        T = float(temp)
-        RH = float(humi)
+        temp_c = float(temp)
+        rh = float(humi)
         a = 17.625
         b = 243.04
-        alpha = ((a * T) / (b + T)) + math.log(RH / 100.0)
+        alpha = ((a * temp_c) / (b + temp_c)) + math.log(rh / 100.0)
         return round((b * alpha) / (a - alpha), 1)
-    except:
+    except (ValueError, TypeError, ZeroDivisionError):
         return None
 
 
@@ -483,7 +482,7 @@ class ToggleSwitch(tk.Canvas):
         self.create_oval(x0, pad, x0 + d, pad + d,
                          fill=self.knob_color, outline=self.knob_color)
 
-    def toggle(self, event=None):
+    def toggle(self, _event=None):
         self.state_on = not self.state_on
         self._draw()
         if self.command:
@@ -757,7 +756,7 @@ def evaluate_smart_rules():
 
 
 # --- MQTT Callback ---
-def on_message(client, userdata, message):
+def on_message(_client, _userdata, message):
     global last_update_time
 
     payload = message.payload.decode("utf-8")
@@ -852,6 +851,7 @@ def schedule_next_hourly_report():
     now = datetime.datetime.now()
     target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
     delay_ms = int((target - now).total_seconds() * 1000)
+    # noinspection PyTypeChecker
     root.after(max(delay_ms, 1000), send_hourly_report)
 
 
@@ -883,6 +883,7 @@ def on_hourly_toggle(is_on):
 # --- Clock ---
 def update_clock():
     lbl_clock.config(text=datetime.datetime.now().strftime("%a %d %b  %H:%M"))
+    # noinspection PyTypeChecker
     root.after(10000, update_clock)
 
 
@@ -909,6 +910,7 @@ def check_rain_status():
 
 
 def schedule_next_rain_check():
+    # noinspection PyTypeChecker
     root.after(15 * 60 * 1000, check_rain_status)  # every 15 minutes
 
 
@@ -949,6 +951,7 @@ def check_overheat():
                 f"✅ All clear - {label} has dropped to {temp}°C "
                 f"(at or below {OVERHEAT_THRESHOLD_C:g}°C). Overheat alarm stopped.")
 
+    # noinspection PyTypeChecker
     root.after(OVERHEAT_REPEAT_SECONDS * 1000, check_overheat)
 
 
@@ -1005,6 +1008,7 @@ def refresh_sky_condition():
 
 
 def schedule_next_sky_check():
+    # noinspection PyTypeChecker
     root.after(15 * 60 * 1000, refresh_sky_condition)  # every 15 minutes
 
 
@@ -1052,6 +1056,7 @@ def schedule_next_log():
         target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
 
     delay_ms = int((target - now).total_seconds() * 1000)
+    # noinspection PyTypeChecker
     root.after(delay_ms, log_sensor_data)
 
 
