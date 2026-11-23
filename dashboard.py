@@ -153,6 +153,10 @@ def calculate_dew_point(temp, humi):
     try:
         temp_c = float(temp)
         rh = float(humi)
+        # float("nan") parses without error, so reject NaN and out-of-range
+        # humidity explicitly - otherwise the dew point comes out as nan.
+        if math.isnan(temp_c) or math.isnan(rh) or not (0 < rh <= 100):
+            return None
         a = 17.625
         b = 243.04
         alpha = ((a * temp_c) / (b + temp_c)) + math.log(rh / 100.0)
@@ -188,6 +192,62 @@ def get_clothing_recommendation(dew_point):
     if dew_point <= CLOTHING_TROUSERS_MAX:
         return {"kieran": "T-shirt and trousers", "ellice": "T-shirt and coat"}
     return {"kieran": "T-shirt and shorts", "ellice": "T-shirt and trousers"}
+
+
+# --- Front-Door Checklists (web dashboard) ---
+# Shown when Kieran's or Ellice's button is tapped on the iPad by the door.
+# Keys are Python weekday numbers: Monday = 0 ... Sunday = 6. Any day not
+# listed (e.g. Kieran's Tuesday, weekends) shows the "nothing_today" message.
+KIERAN_GUITAR_DAY = [
+    "Uni badge", "Guitar", "Effects pedal", "Pedal power supply",
+    "Guitar lead", "XLR cable", "Earplugs", "Picks", "Notepad",
+    "Red Bull", "Cereal bar",
+]
+KIERAN_THURSDAY = ["Uni badge", "Bottle of water", "Huel shake", "Red Bull", "Cereal bar"]
+ELLICE_OFFICE_DAY = ["Work badge", "Work laptop", "Headset", "Notepad and pen", "ADHD meds", "Cereal bar"]
+
+CHECKLISTS = {
+    "kieran": {
+        "name": "Kieran",
+        "days": {0: KIERAN_GUITAR_DAY, 2: KIERAN_GUITAR_DAY, 3: KIERAN_THURSDAY, 4: KIERAN_GUITAR_DAY},
+        "nothing_today": "No uni - nothing to take 🎉",
+    },
+    "ellice": {
+        "name": "Ellice",
+        "days": {1: ELLICE_OFFICE_DAY, 3: ELLICE_OFFICE_DAY},
+        "nothing_today": "Not in the office - nothing to take 🎉",
+    },
+}
+
+# (person, "YYYY-MM-DD") -> set of ticked item names. Kept in memory only, so
+# each day starts fresh automatically (old dates are pruned as we go).
+checklist_ticks: dict[tuple[str, str], set] = {}
+checklist_lock = threading.Lock()
+
+
+def build_checklist(person, date):
+    cfg = CHECKLISTS[person]
+    items = cfg["days"].get(date.weekday(), [])
+    with checklist_lock:
+        ticked = set(checklist_ticks.get((person, date.isoformat()), ()))
+    return {
+        "person": person,
+        "name": cfg["name"],
+        "date": date.isoformat(),
+        "day_label": date.strftime("%A %d %b"),
+        "empty_message": cfg["nothing_today"],
+        "items": [{"name": item, "checked": item in ticked} for item in items],
+    }
+
+
+def checklist_summary():
+    """Today's ticked/total counts per person, for the badges on the buttons."""
+    today = datetime.date.today()
+    summary = {}
+    for person in CHECKLISTS:
+        items = build_checklist(person, today)["items"]
+        summary[person] = {"total": len(items), "done": sum(i["checked"] for i in items)}
+    return summary
 
 
 # --- Weather API Helper ---
@@ -759,8 +819,19 @@ def evaluate_smart_rules():
 def on_message(_client, _userdata, message):
     global last_update_time
 
-    payload = message.payload.decode("utf-8")
+    payload = message.payload.decode("utf-8").strip()
     topic = message.topic
+
+    # Every topic we subscribe to carries a single number. Drop anything that
+    # isn't a finite number (e.g. "nan" from a failed sensor read) so it never
+    # overwrites the last good value in data_cache.
+    try:
+        value = float(payload)
+        if not math.isfinite(value):
+            raise ValueError
+    except ValueError:
+        print(f"Ignoring invalid payload on {topic}: {payload!r}")
+        return
 
     if topic == "home/indoor/temperature":
         data_cache["indoor_temp"] = payload
@@ -1099,6 +1170,7 @@ def build_web_state():
         "pressure_trend_hpa": get_pressure_trend_hpa(),
         "rain_trend_window_hours": RAIN_TREND_WINDOW_HOURS,
         "hourly_enabled": hourly_reports_enabled,
+        "checklists": checklist_summary(),
         "last_update": last_update_time.strftime("%H:%M:%S") if last_update_time else None,
     }
 
@@ -1138,8 +1210,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .toggle-wrap {
     display: flex;
     align-items: center;
-    gap: 8px;
   }
+  .toggle-wrap .switch { margin-left: 8px; }
   #toggle-label {
     font-size: 13px;
     font-weight: bold;
@@ -1155,7 +1227,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .slider {
     position: absolute;
     cursor: pointer;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background-color: #4a4a4a;
     transition: .2s;
     border-radius: 30px;
@@ -1177,6 +1249,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .panels {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
+    grid-gap: 14px;
     gap: 14px;
     margin-bottom: 14px;
   }
@@ -1270,6 +1343,95 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     color: #666;
     font-size: 13px;
   }
+
+  /* --- Front-door checklist buttons + pop-up --- */
+  body { padding-bottom: 76px; }  /* keep the advice panel clear of the fixed bar */
+  .checklist-bar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    display: flex;
+    justify-content: center;
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+    background: rgba(18, 18, 18, 0.95);
+    border-top: 1px solid #2a2a2a;
+    z-index: 5;
+  }
+  .cl-btn {
+    background: #1a1a1a;
+    border: 2px solid #444;
+    border-radius: 22px;
+    color: #eee;
+    font: bold 15px -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    padding: 9px 22px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .cl-btn + .cl-btn { margin-left: 14px; }
+  .cl-btn:active { transform: scale(0.96); }
+  #btn-kieran { border-color: #3498db; }
+  #btn-ellice { border-color: #c39bd3; }
+  .cl-count { font-weight: normal; color: #999; margin-left: 6px; font-size: 13px; }
+  .cl-count.all-done { color: #4ade80; font-weight: bold; }
+
+  .overlay {
+    position: fixed;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background: rgba(0, 0, 0, 0.75);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+  }
+  .overlay.open { display: flex; }
+  .sheet {
+    background: #1a1a1a;
+    border: 2px solid #2a2a2a;
+    border-top: 4px solid #3498db;
+    border-radius: 14px;
+    width: 92vw;
+    max-width: 480px;
+    max-height: 86vh;
+    overflow-y: auto;
+    padding: 18px 18px 14px;
+  }
+  .sheet-head { display: flex; align-items: center; justify-content: space-between; }
+  .sheet-head h2 { margin: 0; font-size: 20px; }
+  #cl-close {
+    background: none; border: none; color: #888;
+    font-size: 24px; padding: 4px 8px; cursor: pointer;
+  }
+  .tabs { display: flex; margin: 12px 0 4px; }
+  .tab + .tab { margin-left: 8px; }
+  .tab {
+    flex: 1;
+    background: #222; border: 1px solid #333; border-radius: 8px;
+    color: #aaa; font: bold 14px -apple-system, Helvetica, Arial, sans-serif;
+    padding: 8px; cursor: pointer;
+  }
+  .tab.active { background: #2e2e2e; color: #fff; border-color: #555; }
+  #cl-day { color: #888; font-size: 13px; margin: 8px 0 6px; }
+  .cl-item {
+    display: flex; align-items: center;
+    padding: 13px 6px;
+    border-bottom: 1px solid #262626;
+    font-size: 18px;
+    cursor: pointer;
+    user-select: none; -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .cl-box {
+    flex: none;
+    margin-right: 14px;
+    width: 28px; height: 28px;
+    border: 2px solid #555; border-radius: 7px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: bold; color: #121212;
+  }
+  .cl-item.done .cl-box { background: #4ade80; border-color: #4ade80; }
+  .cl-item.done .cl-label { color: #666; text-decoration: line-through; }
+  .cl-empty { text-align: center; color: #aaa; font-size: 17px; padding: 30px 10px; }
+  #cl-progress { text-align: center; font-size: 14px; font-weight: bold; color: #888; margin-top: 12px; }
+  #cl-progress.all-done { color: #4ade80; }
 </style>
 </head>
 <body>
@@ -1321,6 +1483,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div id="advice">Awaiting confirmed readings...</div>
+
+<div class="checklist-bar">
+  <button class="cl-btn" id="btn-kieran" data-person="kieran">Kieran<span class="cl-count" id="count-kieran"></span></button>
+  <button class="cl-btn" id="btn-ellice" data-person="ellice">Ellice<span class="cl-count" id="count-ellice"></span></button>
+</div>
+
+<div class="overlay" id="cl-overlay">
+  <div class="sheet" id="cl-sheet" role="dialog" aria-modal="true">
+    <div class="sheet-head">
+      <h2 id="cl-title">Checklist</h2>
+      <button id="cl-close" aria-label="Close">✕</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-offset="0">Today</button>
+      <button class="tab" data-offset="1">Tomorrow</button>
+    </div>
+    <div id="cl-day"></div>
+    <div id="cl-items"></div>
+    <div id="cl-progress"></div>
+  </div>
+</div>
 
 <script>
 const fmt = (v, unit) => (v === null || v === undefined) ? "--" + unit : v + unit;
@@ -1376,6 +1559,24 @@ async function refresh() {
     document.getElementById('toggle-label').textContent =
       'Hourly Report: ' + (s.hourly_enabled ? 'ON' : 'OFF');
     document.getElementById('toggle-label').style.color = s.hourly_enabled ? '#4ade80' : '#777';
+
+    if (s.checklists) {
+      Object.keys(s.checklists).forEach(person => {
+        const c = s.checklists[person];
+        const el = document.getElementById('count-' + person);
+        if (!el) return;
+        if (c.total === 0) {
+          el.textContent = '';
+          el.className = 'cl-count';
+        } else if (c.done >= c.total) {
+          el.textContent = '✓';
+          el.className = 'cl-count all-done';
+        } else {
+          el.textContent = c.done + '/' + c.total;
+          el.className = 'cl-count';
+        }
+      });
+    }
 
     const trendEl = document.getElementById('pressure-trend');
     if (s.pressure_trend_hpa === null || s.pressure_trend_hpa === undefined) {
@@ -1513,6 +1714,135 @@ document.getElementById('toggle-input').addEventListener('change', async (e) => 
   }
 });
 
+// --- Front-door checklists ---
+const CL_ACCENT = { kieran: '#3498db', ellice: '#c39bd3' };
+const CL_AUTO_CLOSE_MS = 90000;   // wall display: fall back to the dashboard after 90s idle
+let clPerson = null, clOffset = 0, clData = null, clCloseTimer = null;
+
+function clBumpAutoClose() {
+  clearTimeout(clCloseTimer);
+  clCloseTimer = setTimeout(closeChecklist, CL_AUTO_CLOSE_MS);
+}
+
+async function openChecklist(person) {
+  clPerson = person;
+  clOffset = 0;
+  clData = null;
+  document.getElementById('cl-sheet').style.borderTopColor = CL_ACCENT[person] || '#888';
+  document.getElementById('cl-overlay').classList.add('open');
+  renderChecklist();
+  clBumpAutoClose();
+  await loadChecklist();
+}
+
+function closeChecklist() {
+  clearTimeout(clCloseTimer);
+  document.getElementById('cl-overlay').classList.remove('open');
+  clPerson = null;
+}
+
+async function loadChecklist() {
+  if (!clPerson) return;
+  try {
+    const res = await fetch(`/api/checklist/${clPerson}?offset=${clOffset}`);
+    clData = await res.json();
+  } catch (e) {
+    console.error('Failed to load checklist', e);
+  }
+  renderChecklist();
+}
+
+function renderChecklist() {
+  const title = document.getElementById('cl-title');
+  const day = document.getElementById('cl-day');
+  const list = document.getElementById('cl-items');
+  const progress = document.getElementById('cl-progress');
+
+  document.querySelectorAll('.tab').forEach(t =>
+    t.classList.toggle('active', Number(t.dataset.offset) === clOffset));
+
+  list.innerHTML = '';
+  if (!clData) {
+    title.textContent = 'Loading…';
+    day.textContent = '';
+    progress.textContent = '';
+    return;
+  }
+
+  title.textContent = clData.name + "'s checklist";
+  title.style.color = CL_ACCENT[clData.person] || '#eee';
+  day.textContent = clData.day_label;
+
+  if (clData.items.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'cl-empty';
+    empty.textContent = clData.empty_message;
+    list.appendChild(empty);
+    progress.textContent = '';
+    progress.className = '';
+    return;
+  }
+
+  clData.items.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'cl-item' + (item.checked ? ' done' : '');
+    const box = document.createElement('span');
+    box.className = 'cl-box';
+    box.textContent = item.checked ? '✓' : '';
+    const label = document.createElement('span');
+    label.className = 'cl-label';
+    label.textContent = item.name;
+    row.appendChild(box);
+    row.appendChild(label);
+    row.addEventListener('click', () => toggleChecklistItem(item));
+    list.appendChild(row);
+  });
+
+  const done = clData.items.filter(i => i.checked).length;
+  const total = clData.items.length;
+  if (done === total) {
+    progress.textContent = 'All packed - have a good day! ✅';
+    progress.className = 'all-done';
+  } else {
+    progress.textContent = `${done} of ${total} packed`;
+    progress.className = '';
+  }
+}
+
+async function toggleChecklistItem(item) {
+  clBumpAutoClose();
+  const person = clPerson;
+  item.checked = !item.checked;   // update instantly, then confirm with the Pi
+  renderChecklist();
+  try {
+    const res = await fetch(`/api/checklist/${person}/toggle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ date: clData.date, item: item.name, checked: item.checked })
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (clPerson === person) { clData = await res.json(); renderChecklist(); }
+  } catch (e) {
+    console.error('Failed to save tick', e);
+    item.checked = !item.checked;
+    renderChecklist();
+  }
+  refresh();
+}
+
+document.querySelectorAll('.cl-btn').forEach(btn =>
+  btn.addEventListener('click', () => openChecklist(btn.dataset.person)));
+document.querySelectorAll('.tab').forEach(tab =>
+  tab.addEventListener('click', () => {
+    clOffset = Number(tab.dataset.offset);
+    clBumpAutoClose();
+    loadChecklist();
+  }));
+document.getElementById('cl-close').addEventListener('click', closeChecklist);
+document.getElementById('cl-overlay').addEventListener('click', e => {
+  if (e.target.id === 'cl-overlay') closeChecklist();   // tap outside the card
+});
+
 refresh();
 setInterval(refresh, 4000);
 
@@ -1564,6 +1894,48 @@ def api_toggle():
     # the rest of the app already touches the UI from a background thread.
     apply_hourly_toggle(is_on)
     return jsonify({"enabled": hourly_reports_enabled})
+
+
+@flask_app.route("/api/checklist/<person>")
+def api_checklist(person):
+    """?offset=0 for today, ?offset=1 for tomorrow."""
+    if person not in CHECKLISTS:
+        return jsonify({"error": "unknown person"}), 404
+    offset = 1 if request.args.get("offset") == "1" else 0
+    date = datetime.date.today() + datetime.timedelta(days=offset)
+    return jsonify(build_checklist(person, date))
+
+
+@flask_app.route("/api/checklist/<person>/toggle", methods=["POST"])
+def api_checklist_toggle(person):
+    if person not in CHECKLISTS:
+        return jsonify({"error": "unknown person"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        date = datetime.date.fromisoformat(str(payload.get("date")))
+    except ValueError:
+        return jsonify({"error": "bad date"}), 400
+
+    today = datetime.date.today()
+    if not (today <= date <= today + datetime.timedelta(days=1)):
+        return jsonify({"error": "date out of range"}), 400
+
+    item = payload.get("item")
+    if item not in CHECKLISTS[person]["days"].get(date.weekday(), []):
+        return jsonify({"error": "unknown item"}), 400
+
+    with checklist_lock:
+        # Drop anything from before today so the store never grows.
+        for key in [k for k in checklist_ticks if k[1] < today.isoformat()]:
+            del checklist_ticks[key]
+        ticked = checklist_ticks.setdefault((person, date.isoformat()), set())
+        if payload.get("checked"):
+            ticked.add(item)
+        else:
+            ticked.discard(item)
+
+    return jsonify(build_checklist(person, date))
 
 
 def start_web_server():
