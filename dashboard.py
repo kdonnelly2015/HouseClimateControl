@@ -201,10 +201,10 @@ def get_clothing_recommendation(dew_point):
 KIERAN_GUITAR_DAY = [
     "Uni badge", "Guitar", "Effects pedal", "Pedal power supply",
     "Guitar lead", "XLR cable", "Earplugs", "Picks", "Notepad",
-    "Red Bull", "Cereal bar",
+    "Red Bull", "Cereal bar", "X3",
 ]
-KIERAN_THURSDAY = ["Uni badge", "Bottle of water", "Huel shake", "Red Bull", "Cereal bar"]
-ELLICE_OFFICE_DAY = ["Work badge", "Work laptop", "Headset", "Notepad and pen", "ADHD meds", "Cereal bar"]
+KIERAN_THURSDAY = ["Uni badge", "Bottle of water", "Huel shake", "Red Bull", "Cereal bar", "X3", "SSD"]
+ELLICE_OFFICE_DAY = ["Work badge", "Work laptop", "Headset", "Notepad and pen", "ADHD meds", "Cereal bar", "Dashcam"]
 
 CHECKLISTS = {
     "kieran": {
