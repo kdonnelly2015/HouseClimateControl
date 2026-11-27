@@ -129,16 +129,31 @@ OVERHEAT_THRESHOLD_C = 30.0
 OVERHEAT_REPEAT_SECONDS = 30
 overheat_active = {"indoor": False, "cabin": False}  # tracks which rooms are alarming
 
+# --- Car De-Icing Alert (Ellice only) ---
+# From DEICE_WATCH_START the outdoor (Weather/BME280) readings are watched for
+# frost conditions. If they hold for CONFIRMATION_SECONDS, Ellice alone gets a
+# Telegram message at DEICE_ALERT_TIME. At most one alert per day.
+ELLICE_CHAT_ID = "8248273321"  # set to whichever of CHAT_IDS is Ellice's
+DEICE_WATCH_START = datetime.time(5, 30)
+DEICE_ALERT_TIME = datetime.time(6, 30)
+DEICE_MAX_TEMP_C = 1.0          # outdoor temp must be below this
+DEICE_MIN_HUMIDITY_PCT = 85.0   # outdoor humidity must be at or above this
+DEICE_MAX_DEW_POINT_C = 2.0     # outdoor dew point must be below this
+deice_confirmed_date = None     # date frost conditions were confirmed in the watch window
+deice_alert_sent_date = None    # date the alert was last sent (prevents duplicates)
+
 # --- Pressure Chart Configuration (web dashboard) ---
 CHART_HISTORY_HOURS = 24   # how much pressure history to retain for the trend chart
 MAX_CHART_POINTS = 300     # downsample the API response above this many points, to keep payloads small
 
 
 # --- Telegram Helper ---
-def send_telegram(message):
+def send_telegram(message, chat_ids=None):
+    """Sends to everyone in CHAT_IDS by default, or only to `chat_ids` if given
+    (e.g. [ELLICE_CHAT_ID] for alerts that are just for one person)."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    for chat_id in CHAT_IDS:
+    for chat_id in (CHAT_IDS if chat_ids is None else chat_ids):
         payload = {"chat_id": chat_id, "text": message}
         try:
             requests.post(url, json=payload, timeout=5)
@@ -563,6 +578,7 @@ def evaluate_smart_rules():
     global window_advice, is_too_hot, committed_ui
     global last_19c_warning_date, last_forecast_date, forecasted_max_temp, cool_day_notified
     global rain_alert_active, low_pressure_rain_active
+    global deice_confirmed_date
 
     in_temp_raw = data_cache["indoor_temp"]
     in_humi_raw = data_cache["indoor_humi"]
@@ -814,6 +830,18 @@ def evaluate_smart_rules():
         elif current_pressure > LOW_PRESSURE_RAIN_THRESHOLD_HPA:
             clear_pending("low_pressure_rain")
 
+    # ==========================================
+    # 6. Car De-Icing Watch (Ellice, 05:30 - 06:00)
+    # ==========================================
+    # Only *records* that frost conditions were confirmed. The message itself
+    # goes out at DEICE_ALERT_TIME from send_deice_alert().
+    if DEICE_WATCH_START <= now.time() < DEICE_ALERT_TIME and deice_confirmed_date != today:
+        if deice_conditions_met():
+            if confirmed_reading("deice", today.isoformat()):
+                deice_confirmed_date = today
+        else:
+            clear_pending("deice")
+
 
 # --- MQTT Callback ---
 def on_message(_client, _userdata, message):
@@ -986,10 +1014,73 @@ def schedule_next_rain_check():
 
 
 # --- Overheat Safety Alarm ---
-def send_telegram_async(message):
+def send_telegram_async(message, chat_ids=None):
     """Sends without blocking the Tkinter mainloop, so a slow or unreachable
     Telegram API can never freeze the dashboard or delay the next alarm."""
-    threading.Thread(target=send_telegram, args=(message,), daemon=True).start()
+    threading.Thread(target=send_telegram, args=(message, chat_ids), daemon=True).start()
+
+
+# --- Car De-Icing Alert (Ellice only) ---
+def get_deice_readings():
+    """Current outdoor (Weather sensor) temp, humidity and dew point as floats,
+    or None if any of them isn't available yet."""
+    try:
+        temp = float(data_cache["weather_temp"])
+        humi = float(data_cache["weather_humi"])
+    except (ValueError, TypeError):
+        return None
+    dew = calculate_dew_point(temp, humi)
+    if dew is None:
+        return None
+    return temp, humi, dew
+
+
+def deice_conditions_met():
+    """True if the outdoor readings suggest Ellice's car will need de-icing."""
+    readings = get_deice_readings()
+    if readings is None:
+        return False
+    temp, humi, dew = readings
+    return (temp < DEICE_MAX_TEMP_C
+            and humi >= DEICE_MIN_HUMIDITY_PCT
+            and dew < DEICE_MAX_DEW_POINT_C)
+
+
+def send_deice_alert():
+    """Fires at DEICE_ALERT_TIME each day. Messages Ellice only if frost conditions
+    were confirmed during the watch window, or if they're true right now (covers
+    the Pi having restarted just before 6am, with no time left to confirm)."""
+    global deice_alert_sent_date
+    today = datetime.date.today()
+
+    if deice_alert_sent_date != today and (deice_confirmed_date == today or deice_conditions_met()):
+        if not ELLICE_CHAT_ID.isdigit():
+            print("De-ice alert triggered, but ELLICE_CHAT_ID isn't set - not sending.")
+        else:
+            readings = get_deice_readings()
+            detail = (f"\n\nOutside: {readings[0]}°C, {readings[1]}% humidity, dew point {readings[2]}°C"
+                      if readings else "")
+            send_telegram_async(
+                "🧊 Allow time to de-ice your car" + detail +
+                f"\n\n[Condition: time >= {DEICE_WATCH_START.strftime('%H:%M')} & "
+                f"t_out < {DEICE_MAX_TEMP_C:g} & h_out >= {DEICE_MIN_HUMIDITY_PCT:g} & "
+                f"out_dew < {DEICE_MAX_DEW_POINT_C:g}]",
+                chat_ids=[ELLICE_CHAT_ID])
+        deice_alert_sent_date = today
+
+    clear_pending("deice")
+    schedule_next_deice_alert()
+
+
+def schedule_next_deice_alert():
+    """Calculates milliseconds until the next DEICE_ALERT_TIME."""
+    now = datetime.datetime.now()
+    target = datetime.datetime.combine(now.date(), DEICE_ALERT_TIME)
+    if target <= now:
+        target += datetime.timedelta(days=1)
+    delay_ms = int((target - now).total_seconds() * 1000)
+    # noinspection PyTypeChecker
+    root.after(max(delay_ms, 1000), send_deice_alert)
 
 
 def check_overheat():
@@ -2024,6 +2115,7 @@ init_log_file()
 schedule_next_log()
 schedule_next_hourly_report()
 schedule_next_rain_check()
+schedule_next_deice_alert()  # Ellice's car de-icing alert, daily at DEICE_ALERT_TIME
 check_overheat()  # safety alarm: checks now, then every OVERHEAT_REPEAT_SECONDS
 refresh_sky_condition()  # fetch immediately, then re-schedules itself every 15 min
 update_clock()
